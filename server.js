@@ -14,7 +14,14 @@ app.get('/', (req, res) => {
 });
 
 const server = http.createServer(app);
-const wss = new WebSocketServer({ server });
+const wss = new WebSocketServer({
+  server,
+  perMessageDeflate: {
+    clientNoContextTakeover: true,
+    serverNoContextTakeover: true,
+    threshold: 512,
+  },
+});
 
 // code -> { host: ws, guest: ws|null }
 const rooms = new Map();
@@ -23,7 +30,7 @@ let waitingPlayer = null;
 // 游戏状态是实时快照：旧 state 没有补发价值。这里做合并/节流，避免客端网络或设备稍慢时
 // WebSocket 可靠队列越积越长，看到的画面变成过期录像。
 const STATE_FORWARD_INTERVAL_MS = 1000 / 30;
-const MAX_STATE_BUFFERED_BYTES = 256 * 1024;
+const MAX_STATE_BUFFERED_BYTES = 128 * 1024;
 
 function makeCode() {
   let code;

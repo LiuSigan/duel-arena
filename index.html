@@ -1395,12 +1395,12 @@ function draw() {
 function loop() {
   if (netMode === 'guest') {
     sendGuestInput();
-    // 插值：每帧向最新网络坐标逼近，画面平滑不跳帧
+    predictGuestPlayer();
+    // 插值：远端蓝方平滑追随网络坐标；本地红方先预测，再用房主权威坐标轻微纠偏。
     if (netTarget.has) {
-      p1.x += (netTarget.p1x - p1.x) * NET_INTERP_ALPHA;
-      p1.y += (netTarget.p1y - p1.y) * NET_INTERP_ALPHA;
-      p2.x += (netTarget.p2x - p2.x) * NET_INTERP_ALPHA;
-      p2.y += (netTarget.p2y - p2.y) * NET_INTERP_ALPHA;
+      p1.x += (netTarget.p1x - p1.x) * NET_REMOTE_INTERP_ALPHA;
+      p1.y += (netTarget.p1y - p1.y) * NET_REMOTE_INTERP_ALPHA;
+      reconcileGuestPrediction();
     }
     tickRemoteVisuals();
   } else {
@@ -1438,13 +1438,17 @@ let remoteInput = { up: false, down: false, left: false, right: false, shoot: fa
 let netTarget = { has: false, p1x: 0, p1y: 0, p2x: 0, p2y: 0 };
 const NET_STATE_INTERVAL_MS = 1000 / 30;
 const NET_INPUT_HEARTBEAT_MS = 250;
-const NET_MAX_BUFFERED_BYTES = 128 * 1024;
-const NET_INTERP_ALPHA = 0.35;
+const NET_MAX_BUFFERED_BYTES = 64 * 1024;
+const NET_REMOTE_INTERP_ALPHA = 0.42;
+const NET_OWN_RECONCILE_ALPHA = 0.12;
+const NET_OWN_SNAP_DISTANCE = 90;
 let lastStateSentAt = 0;
 let lastInputSentAt = 0;
 let lastInputPayload = '';
 let inputSeq = 0;
 let lastRemoteVisualAt = performance.now();
+let lastObstacleSyncKey = '';
+let lastObstacleSyncAt = 0;
 
 function resetNetSyncState() {
   remoteInput = { up: false, down: false, left: false, right: false, shoot: false };
@@ -1453,6 +1457,8 @@ function resetNetSyncState() {
   lastInputSentAt = 0;
   lastInputPayload = '';
   lastRemoteVisualAt = performance.now();
+  lastObstacleSyncKey = '';
+  lastObstacleSyncAt = 0;
 }
 
 function isNetInputCode(code) {
@@ -1607,60 +1613,111 @@ function sendGuestInput(force = false) {
   }
 }
 
+function predictGuestPlayer() {
+  if (!gameRunning || roundOver || !p2 || !p2.alive) return;
+  const prevX = p2.x, prevY = p2.y;
+  const input = getGuestInput();
+  let dx = 0, dy = 0;
+  if (input.up) dy -= 1;
+  if (input.down) dy += 1;
+  if (input.left) dx -= 1;
+  if (input.right) dx += 1;
+  const len = Math.hypot(dx, dy);
+  if (len > 0) {
+    tryMove(p2, (dx / len) * BASE_PLAYER_SPEED * speedMult, (dy / len) * BASE_PLAYER_SPEED * speedMult);
+    if (MAPS[currentMapKey].dynamic) resolveObstacleOverlap(p2);
+  }
+  p2.vx = p2.x - prevX;
+  p2.vy = p2.y - prevY;
+}
+
+function reconcileGuestPrediction() {
+  const dx = netTarget.p2x - p2.x;
+  const dy = netTarget.p2y - p2.y;
+  const drift = Math.hypot(dx, dy);
+  if (drift > NET_OWN_SNAP_DISTANCE || roundOver || !p2.alive) {
+    p2.x = netTarget.p2x;
+    p2.y = netTarget.p2y;
+  } else {
+    p2.x += dx * NET_OWN_RECONCILE_ALPHA;
+    p2.y += dy * NET_OWN_RECONCILE_ALPHA;
+  }
+}
+
 function netNum(n) {
   return Math.round(n * 10) / 10;
+}
+
+function obstacleSyncKey() {
+  return obstacles.map(o => `${netNum(o.x)},${netNum(o.y)},${netNum(o.w)},${netNum(o.h)}`).join('|');
 }
 
 function buildNetPlayer(player) {
   return {
     x: netNum(player.x), y: netNum(player.y),
     hp: player.hp, alive: player.alive, hitFlash: player.hitFlash,
-    color: player.color, colorLight: player.colorLight, colorDark: player.colorDark,
     ammo: player.ammo, reloading: player.reloading,
   };
 }
 
-function buildState() {
+function buildState(force = false) {
+  const now = performance.now();
+  const overlayShow = document.getElementById('overlay').classList.contains('show');
+  let obstaclePayload = null;
+  if (MAPS[currentMapKey].dynamic) {
+    const key = obstacleSyncKey();
+    if (force || key !== lastObstacleSyncKey || now - lastObstacleSyncAt > 1000) {
+      obstaclePayload = obstacles.map(o => ({ x: netNum(o.x), y: netNum(o.y), w: netNum(o.w), h: netNum(o.h) }));
+      lastObstacleSyncKey = key;
+      lastObstacleSyncAt = now;
+    }
+  }
+
+  const state = {
+    p1: buildNetPlayer(p1),
+    p2: buildNetPlayer(p2),
+    bullets: bullets.map(b => ({
+      x: netNum(b.x), y: netNum(b.y),
+      vx: netNum(b.vx || 0), vy: netNum(b.vy || 0),
+      bounces: b.bounces || 0,
+      ownerColor: b.owner.color,
+    })),
+    particles: particles.slice(-40).map(pt => ({
+      x: netNum(pt.x), y: netNum(pt.y),
+      vx: netNum(pt.vx || 0), vy: netNum(pt.vy || 0),
+      life: netNum(pt.life), color: pt.color,
+    })),
+    floatingTexts: floatingTexts.slice(-8).map(t => ({
+      x: netNum(t.x), y: netNum(t.y),
+      text: t.text, color: t.color, life: netNum(t.life), vy: netNum(t.vy || -0.8),
+    })),
+    healthPickup: healthPickup ? { x: netNum(healthPickup.x), y: netNum(healthPickup.y), pulse: netNum(healthPickup.pulse) } : null,
+    // 幻变战场的墙只在变化时同步；否则复用客端上一份墙数据，避免每帧重复发大数组。
+    obstacles: obstaclePayload,
+    score1, score2, roundOver, matchOver, shakeTimer: netNum(shakeTimer), shakeMag: netNum(shakeMag),
+    overlayShow,
+  };
+
+  if (overlayShow) {
+    state.winnerText = document.getElementById('winnerText').textContent;
+    state.winnerColor = document.getElementById('winnerText').style.color;
+    state.matchScoreText = document.getElementById('matchScoreText').textContent;
+    state.matchEndShow = document.getElementById('matchEndPanel').style.display === 'block';
+    state.matchEndTitle = document.getElementById('matchEndTitle').textContent;
+    state.matchEndColor = document.getElementById('matchEndTitle').style.color;
+    state.matchEndTaunt = document.getElementById('matchEndTaunt').textContent;
+  }
+
   return {
     type: 'state',
-    state: {
-      p1: buildNetPlayer(p1),
-      p2: buildNetPlayer(p2),
-      bullets: bullets.map(b => ({
-        x: netNum(b.x), y: netNum(b.y),
-        vx: netNum(b.vx || 0), vy: netNum(b.vy || 0),
-        bounces: b.bounces || 0,
-        ownerColor: b.owner.color,
-      })),
-      particles: particles.slice(-80).map(pt => ({
-        x: netNum(pt.x), y: netNum(pt.y),
-        vx: netNum(pt.vx || 0), vy: netNum(pt.vy || 0),
-        life: netNum(pt.life), color: pt.color,
-      })),
-      floatingTexts: floatingTexts.slice(-20).map(t => ({
-        x: netNum(t.x), y: netNum(t.y),
-        text: t.text, color: t.color, life: netNum(t.life), vy: netNum(t.vy || -0.8),
-      })),
-      healthPickup: healthPickup ? { x: netNum(healthPickup.x), y: netNum(healthPickup.y), pulse: netNum(healthPickup.pulse) } : null,
-      // 幻变战场的墙会实时变化，同步给加入方，让双方画面一致（静态地图不需要，省流量）
-      obstacles: MAPS[currentMapKey].dynamic ? obstacles.map(o => ({ x: netNum(o.x), y: netNum(o.y), w: netNum(o.w), h: netNum(o.h) })) : null,
-      score1, score2, roundOver, matchOver, shakeTimer: netNum(shakeTimer), shakeMag: netNum(shakeMag),
-      overlayShow: document.getElementById('overlay').classList.contains('show'),
-      winnerText: document.getElementById('winnerText').textContent,
-      winnerColor: document.getElementById('winnerText').style.color,
-      matchScoreText: document.getElementById('matchScoreText').textContent,
-      matchEndShow: document.getElementById('matchEndPanel').style.display === 'block',
-      matchEndTitle: document.getElementById('matchEndTitle').textContent,
-      matchEndColor: document.getElementById('matchEndTitle').style.color,
-      matchEndTaunt: document.getElementById('matchEndTaunt').textContent,
-    },
+    state,
   };
 }
 
 function broadcastState(force = false) {
   const now = performance.now();
   if (!force && now - lastStateSentAt < NET_STATE_INTERVAL_MS) return;
-  const msg = buildState();
+  const msg = buildState(force);
   if (force) msg.critical = true;
   if (wsSend(msg)) lastStateSentAt = now;
 }
