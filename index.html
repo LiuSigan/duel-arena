@@ -581,7 +581,8 @@ function triggerShake(mag) {
 }
 
 function spawnFloatingText(x, y, text, color) {
-  floatingTexts.push({ x, y, text, color, life: 42, vy: -0.8 });
+  // 加入方本地结算产生的文字打上 local 标记，套用房主状态包时予以保留
+  floatingTexts.push({ x, y, text, color, life: 42, vy: -0.8, local: netMode === 'guest' });
 }
 
 // ---------- 人形部位定义（局部坐标系，x轴指向朝向方向） ----------
@@ -637,7 +638,11 @@ function resetRound() {
   pickupRespawnTimer = 150;
   shakeTimer = 0;
   lastLocalShotAt = 0;
+  lastLocalHitAt = 0;
   processedGuestShots.clear();
+  processedGuestHits.clear();
+  reportedGuestHits.clear();
+  predictedBullets = [];
   roundOver = false;
   document.getElementById('overlay').classList.remove('show');
   document.getElementById('matchEndPanel').style.display = 'none';
@@ -1023,13 +1028,13 @@ function applyDamage(target, part) {
   updateHUD();
 }
 
-// 加入方本地预测命中时用：效果和 applyDamage 一样（真实扣血、真实特效），
-// 唯一区别是不会在本地判定"死亡/回合结束"——谁赢一局必须由房主的权威状态说了算，
-// 否则两边可能因为极小的坐标误差各自判定出不同的胜负，造成分歧
+// 加入方本地命中时用：真实扣血、真实特效，和 applyDamage 完全一样，
+// 唯一区别是不在本地宣布"回合结束"——击杀由命中上报送到房主，房主 applyDamage 后
+// 通过权威状态把 roundOver 发回来，保证双方对胜负的认定永远一致
 function applyPredictedDamage(target, part) {
   const dmg = damageForPart(part);
   if (dmg <= 0) return;
-  target.hp = Math.max(1, target.hp - dmg);
+  target.hp = Math.max(0, target.hp - dmg);
   target.hitFlash = 8;
   spawnParticles(target.x, target.y, target.color, part);
   const label = part === 'head' ? `爆头 -${dmg}` : `-${dmg}`;
@@ -1086,6 +1091,7 @@ function spawnParticles(x, y, color, part) {
       vy: Math.sin(a) * spd,
       life: 25 + Math.random() * 15,
       color,
+      local: netMode === 'guest',
     });
   }
 }
@@ -1169,6 +1175,9 @@ function update() {
     }
 
     if (b.target.alive) {
+      // 联机时客方的子弹由射手客户端结算（handleGuestHit 记账），房主这边只负责飞行轨迹展示，
+      // 不做二次命中判定——否则两边坐标的细微差异会造成"你看打中了、我看没打中"
+      if (netMode === 'host' && b.ownerSide === 'guest') continue;
       const hit = getSweptHit(b, b.target, prevX, prevY);
       if (hit) {
         b.x = hit.x;
@@ -1521,8 +1530,13 @@ let lastRemoteVisualAt = performance.now();
 let lastObstacleSyncKey = '';
 let lastObstacleSyncAt = 0;
 let lastLocalShotAt = 0;
+let lastLocalHitAt = 0;
 let pendingLocalRestartUntil = 0;
 let processedGuestShots = new Set();
+// 房主端：已经记过账的客方命中上报（防重复结算）
+let processedGuestHits = new Set();
+// 加入方：已经在本地结算完命中的 shotId——权威包里这些子弹要过滤掉，防止"尸体"子弹回流重画
+let reportedGuestHits = new Set();
 
 function resetNetSyncState() {
   remoteInput = { up: false, down: false, left: false, right: false };
@@ -1536,8 +1550,11 @@ function resetNetSyncState() {
   lastObstacleSyncKey = '';
   lastObstacleSyncAt = 0;
   lastLocalShotAt = 0;
+  lastLocalHitAt = 0;
   pendingLocalRestartUntil = 0;
   processedGuestShots.clear();
+  processedGuestHits.clear();
+  reportedGuestHits.clear();
   predictedBullets = [];
 }
 
@@ -1620,6 +1637,9 @@ function handleServerMsg(msg) {
       break;
     case 'shot':
       handleGuestShot(msg);
+      break;
+    case 'hit':
+      handleGuestHit(msg);
       break;
     case 'state':
       applyRemoteState(msg.state);
@@ -1737,6 +1757,7 @@ function tryGuestShoot() {
       vy: Math.sin(angle + spread) * (2 + Math.random() * 2),
       life: 8 + Math.random() * 6,
       color: '#ffe082',
+      local: true,
     });
   }
 
@@ -1848,6 +1869,21 @@ function handleGuestShot(msg) {
   broadcastState(true);
 }
 
+// 客方子弹的命中由射手客户端结算后上报，这里负责记账：真实扣血、判定击杀和回合结束。
+// 双方物理代码和墙体数据完全一致，正常情况下这个上报和房主自己模拟的弹道是吻合的。
+function handleGuestHit(msg) {
+  if (netMode !== 'host' || !gameRunning || roundOver) return;
+  if (!msg.seq || processedGuestHits.has(msg.seq)) return;
+  processedGuestHits.add(msg.seq);
+  // 摘掉这发子弹在房主端的展示副本，别让它继续飞
+  const idx = bullets.findIndex(b => b.ownerSide === 'guest' && b.shotId === msg.seq);
+  if (idx >= 0) bullets.splice(idx, 1);
+  const part = (msg.part === 'head' || msg.part === 'body' || msg.part === 'limb') ? msg.part : null;
+  if (!part || !p1.alive) return;
+  applyDamage(p1, part);
+  broadcastState(true);
+}
+
 function netNum(n) {
   return Math.round(n * 10) / 10;
 }
@@ -1939,7 +1975,7 @@ function applyRemoteState(s) {
   if (netMode === 'guest' && pendingLocalRestartUntil > 0 && !s.roundOver) pendingLocalRestartUntil = 0;
 
   // 保留当前渲染坐标，把网络包里的最新坐标记为插值目标，渲染循环里平滑逼近
-  const r1x = p1.x, r1y = p1.y;
+  const r1x = p1.x, r1y = p1.y, localP1Hp = p1.hp;
   const localP2 = {
     x: p2.x, y: p2.y, vx: p2.vx, vy: p2.vy,
     ammo: p2.ammo, reloading: p2.reloading, reloadTimer: p2.reloadTimer, cooldown: p2.cooldown,
@@ -1953,6 +1989,9 @@ function applyRemoteState(s) {
   netTarget.has = true;
   // 蓝方是远端玩家：距离太大说明是重生/复位，直接瞬移；否则维持当前渲染位置等待插值。
   if (Math.hypot(s.p1.x - r1x, s.p1.y - r1y) < 80) { p1.x = r1x; p1.y = r1y; }
+  // 刚在本地结算过命中：房主的记账确认还在路上，这段时间的状态包带的还是旧 HP，
+  // 直接采用会把刚扣掉的血"回上去"（这就是之前"弹了伤害数字但没掉血"的原因）
+  if (netMode === 'guest' && now - lastLocalHitAt < 700) p1.hp = Math.min(localP1Hp, s.p1.hp);
   // 红方是本机玩家：活动回合中不吃房主回传坐标，避免网络校正把角色来回拽。
   if (netMode === 'guest' && s.p2.alive && !s.roundOver && !wasRoundOver) {
     p2.x = localP2.x; p2.y = localP2.y;
@@ -1971,14 +2010,17 @@ function applyRemoteState(s) {
     shotId: b.shotId || null,
     ownerSide: b.ownerSide || null,
   }));
-  bullets = authoritativeBullets;
-  // 权威子弹已经落地：把对应的本地预测子弹摘掉，避免同一发子弹画出两颗
-  if (predictedBullets.length) {
-    const confirmedShotIds = new Set(authoritativeBullets.filter(b => b.ownerSide === 'guest' && b.shotId).map(b => b.shotId));
-    predictedBullets = predictedBullets.filter(pb => !confirmedShotIds.has(pb.shotId));
-  }
-  particles = s.particles.map(pt => ({ ...pt, vx: pt.vx || 0, vy: pt.vy || 0 }));
-  floatingTexts = s.floatingTexts.map(t => ({ ...t, vy: t.vy || -0.8 }));
+  // 自己打出去的子弹以本地实时模拟为准：权威包里同一发子弹（正在飞的重复品）
+  // 和已经在本地结算掉的（命中上报在路上）都过滤掉——本地模拟绝不被网络包打断或回退
+  const localShotIds = new Set(predictedBullets.map(pb => pb.shotId));
+  bullets = authoritativeBullets.filter(b =>
+    !(b.ownerSide === 'guest' && b.shotId && (localShotIds.has(b.shotId) || reportedGuestHits.has(b.shotId)))
+  );
+  // 本地刚出的枪口火花/伤害数字带 local 标记，别被状态包整体覆盖冲掉
+  const keptParticles = particles.filter(pt => pt.local);
+  const keptTexts = floatingTexts.filter(t => t.local);
+  particles = s.particles.map(pt => ({ ...pt, vx: pt.vx || 0, vy: pt.vy || 0 })).concat(keptParticles);
+  floatingTexts = s.floatingTexts.map(t => ({ ...t, vy: t.vy || -0.8 })).concat(keptTexts);
   healthPickup = s.healthPickup;
   if (s.obstacles) obstacles = s.obstacles;
   score1 = s.score1; score2 = s.score2;
@@ -2024,9 +2066,9 @@ function tickRemoteVisuals() {
     b.y += (b.vy || 0) * dt;
   }
 
-  // 本地预测子弹：用和房主完全一样的物理（stepBullet 撞墙反弹 + getSweptHit 命中判定）
-  // 在本地跑一遍真实模拟——不是纯装饰，撞墙真的会弹、打中真的会扣血。
-  // 房主的权威结果几乎同时通过状态包回来做确认/纠正，两边几乎不会有肉眼可见的差异。
+  // 自己打出去的子弹：从出膛到落点全程本地真实结算（stepBullet 撞墙反弹 + getSweptHit 命中），
+  // 命中瞬间本地立刻扣血出特效，同时把命中结果上报给房主记账（扣血、判定击杀/回合结束）。
+  // 房主不再对这发子弹做二次判定，所以不存在"本地打中了、房主说没打中"的回退。
   for (let i = predictedBullets.length - 1; i >= 0; i--) {
     const pb = predictedBullets[i];
     const { prevX, prevY, bounced, expired } = stepBullet(pb, obstacles, W, H);
@@ -2037,17 +2079,21 @@ function tickRemoteVisuals() {
       continue;
     }
 
-    if (p1.alive) {
+    if (p1.alive && !roundOver) {
       const hit = getSweptHit(pb, p1, prevX, prevY);
       if (hit) {
         pb.x = hit.x; pb.y = hit.y;
         applyPredictedDamage(p1, hit.part);
+        lastLocalHitAt = now;
+        if (pb.shotId) reportedGuestHits.add(pb.shotId);
+        wsSend({ type: 'hit', seq: pb.shotId, part: hit.part, x: netNum(hit.x), y: netNum(hit.y) });
         predictedBullets.splice(i, 1);
         continue;
       }
     }
 
-    if (now - pb.spawnedAt > 900) predictedBullets.splice(i, 1);
+    // 安全兜底：正常情况下子弹靠 5 次反弹自然消亡，这里只挡极端泄漏
+    if (now - pb.spawnedAt > 5000) predictedBullets.splice(i, 1);
   }
 
   for (let i = particles.length - 1; i >= 0; i--) {
