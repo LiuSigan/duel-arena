@@ -1023,6 +1023,58 @@ function applyDamage(target, part) {
   updateHUD();
 }
 
+// 加入方本地预测命中时用：效果和 applyDamage 一样（真实扣血、真实特效），
+// 唯一区别是不会在本地判定"死亡/回合结束"——谁赢一局必须由房主的权威状态说了算，
+// 否则两边可能因为极小的坐标误差各自判定出不同的胜负，造成分歧
+function applyPredictedDamage(target, part) {
+  const dmg = damageForPart(part);
+  if (dmg <= 0) return;
+  target.hp = Math.max(1, target.hp - dmg);
+  target.hitFlash = 8;
+  spawnParticles(target.x, target.y, target.color, part);
+  const label = part === 'head' ? `爆头 -${dmg}` : `-${dmg}`;
+  spawnFloatingText(target.x, target.y - 20, label, part === 'head' ? '#ffd54f' : '#ffffff');
+  triggerShake(part === 'head' ? 7 : part === 'body' ? 4 : 2);
+  updateHUD();
+}
+
+// 子弹推进一步的物理：撞边界/撞墙就反弹，超过 5 次反弹就算飞行结束。
+// 房主的真实模拟和加入方的本地预测子弹共用这一份代码，保证撞墙表现完全一致，不会"预测版能穿墙"。
+function stepBullet(b, obstaclesList, worldW, worldH) {
+  const prevX = b.x, prevY = b.y;
+  b.x += b.vx;
+  b.y += b.vy;
+
+  let bounced = false;
+  if (b.x < 2 || b.x > worldW - 2) {
+    b.vx = -b.vx;
+    b.x = prevX; b.y = prevY;
+    bounced = true;
+  } else if (b.y < 2 || b.y > worldH - 2) {
+    b.vy = -b.vy;
+    b.x = prevX; b.y = prevY;
+    bounced = true;
+  }
+
+  if (!bounced) {
+    for (const ob of obstaclesList) {
+      if (b.x > ob.x && b.x < ob.x + ob.w && b.y > ob.y && b.y < ob.y + ob.h) {
+        const hitVerticalWall = prevY > ob.y && prevY < ob.y + ob.h;
+        const hitHorizontalWall = prevX > ob.x && prevX < ob.x + ob.w;
+        if (hitVerticalWall && !hitHorizontalWall) b.vx = -b.vx;
+        else if (hitHorizontalWall && !hitVerticalWall) { b.vy = -b.vy; }
+        else { b.vx = -b.vx; b.vy = -b.vy; }
+        b.x = prevX; b.y = prevY;
+        bounced = true;
+        break;
+      }
+    }
+  }
+
+  if (bounced) b.bounces = (b.bounces || 0) + 1;
+  return { prevX, prevY, bounced, expired: bounced && b.bounces >= 5 };
+}
+
 function spawnParticles(x, y, color, part) {
   const count = part === 'head' ? 22 : part === 'body' ? 14 : 8;
   for (let i = 0; i < count; i++) {
@@ -1108,53 +1160,11 @@ function update() {
 
   for (let i = bullets.length - 1; i >= 0; i--) {
     const b = bullets[i];
-    const prevX = b.x, prevY = b.y;
-    b.x += b.vx;
-    b.y += b.vy;
-
-    let bounced = false;
-
-    // 撞到场地边界：反弹
-    if (b.x < 2 || b.x > W - 2) {
-      b.vx = -b.vx;
-      b.x = prevX;
-      b.y = prevY;
-      bounced = true;
-    } else if (b.y < 2 || b.y > H - 2) {
-      b.vy = -b.vy;
-      b.x = prevX;
-      b.y = prevY;
-      bounced = true;
-    }
-
-    // 撞到障碍物墙壁：反弹（根据来向判断打在哪一面）
-    if (!bounced) {
-      for (const ob of obstacles) {
-        if (b.x > ob.x && b.x < ob.x + ob.w && b.y > ob.y && b.y < ob.y + ob.h) {
-          const hitVerticalWall = prevY > ob.y && prevY < ob.y + ob.h;
-          const hitHorizontalWall = prevX > ob.x && prevX < ob.x + ob.w;
-          if (hitVerticalWall && !hitHorizontalWall) {
-            b.vx = -b.vx;
-          } else if (hitHorizontalWall && !hitVerticalWall) {
-            b.vy = -b.vy;
-          } else {
-            b.vx = -b.vx;
-            b.vy = -b.vy;
-          }
-          b.x = prevX;
-          b.y = prevY;
-          bounced = true;
-          break;
-        }
-      }
-    }
+    const { prevX, prevY, bounced, expired } = stepBullet(b, obstacles, W, H);
 
     if (bounced) {
-      b.bounces = (b.bounces || 0) + 1;
       spawnParticles(b.x, b.y, b.owner.color, 'limb'); // 反弹火花，数量少一点
-      if (b.bounces >= 5) {
-        bullets.splice(i, 1);
-      }
+      if (expired) bullets.splice(i, 1);
       continue;
     }
 
@@ -1367,11 +1377,12 @@ function drawBullets() {
 // 加入方本地预测的子弹，画法和权威子弹一致，权威版本落地后会顶替它
 function drawPredictedBullets() {
   for (const b of predictedBullets) {
+    const bounceBoost = (b.bounces || 0) * 2;
     ctx.beginPath();
     ctx.arc(b.x, b.y, 4, 0, Math.PI * 2);
     ctx.fillStyle = b.owner.color;
     ctx.shadowColor = b.owner.color;
-    ctx.shadowBlur = 8;
+    ctx.shadowBlur = 8 + bounceBoost;
     ctx.fill();
     ctx.shadowBlur = 0;
   }
@@ -2013,13 +2024,30 @@ function tickRemoteVisuals() {
     b.y += (b.vy || 0) * dt;
   }
 
-  // 本地预测子弹：按下开枪键起就自己飞，直到房主的权威子弹落地顶替它（或超时兜底清掉）
+  // 本地预测子弹：用和房主完全一样的物理（stepBullet 撞墙反弹 + getSweptHit 命中判定）
+  // 在本地跑一遍真实模拟——不是纯装饰，撞墙真的会弹、打中真的会扣血。
+  // 房主的权威结果几乎同时通过状态包回来做确认/纠正，两边几乎不会有肉眼可见的差异。
   for (let i = predictedBullets.length - 1; i >= 0; i--) {
     const pb = predictedBullets[i];
-    pb.x += pb.vx * dt;
-    pb.y += pb.vy * dt;
-    const outOfBounds = pb.x < -20 || pb.x > W + 20 || pb.y < -20 || pb.y > H + 20;
-    if (outOfBounds || now - pb.spawnedAt > 900) predictedBullets.splice(i, 1);
+    const { prevX, prevY, bounced, expired } = stepBullet(pb, obstacles, W, H);
+
+    if (bounced) {
+      spawnParticles(pb.x, pb.y, pb.owner.color, 'limb');
+      if (expired) predictedBullets.splice(i, 1);
+      continue;
+    }
+
+    if (p1.alive) {
+      const hit = getSweptHit(pb, p1, prevX, prevY);
+      if (hit) {
+        pb.x = hit.x; pb.y = hit.y;
+        applyPredictedDamage(p1, hit.part);
+        predictedBullets.splice(i, 1);
+        continue;
+      }
+    }
+
+    if (now - pb.spawnedAt > 900) predictedBullets.splice(i, 1);
   }
 
   for (let i = particles.length - 1; i >= 0; i--) {
