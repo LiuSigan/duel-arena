@@ -1364,6 +1364,19 @@ function drawBullets() {
   }
 }
 
+// 加入方本地预测的子弹，画法和权威子弹一致，权威版本落地后会顶替它
+function drawPredictedBullets() {
+  for (const b of predictedBullets) {
+    ctx.beginPath();
+    ctx.arc(b.x, b.y, 4, 0, Math.PI * 2);
+    ctx.fillStyle = b.owner.color;
+    ctx.shadowColor = b.owner.color;
+    ctx.shadowBlur = 8;
+    ctx.fill();
+    ctx.shadowBlur = 0;
+  }
+}
+
 function drawParticles() {
   for (const pt of particles) {
     ctx.globalAlpha = Math.max(pt.life / 30, 0);
@@ -1427,6 +1440,7 @@ function draw() {
   drawObstacles();
   drawPickup();
   drawBullets();
+  drawPredictedBullets();
   drawPlayer(p1, p2);
   drawPlayer(p2, p1);
   drawParticles();
@@ -1480,7 +1494,10 @@ let netMode = null; // null | 'host' | 'guest'
 let ws = null;
 let remoteInput = { up: false, down: false, left: false, right: false };
 let remotePose = { has: false, x: 0, y: 0, vx: 0, vy: 0, seq: 0 };
-let netTarget = { has: false, p1x: 0, p1y: 0, p2x: 0, p2y: 0 };
+let netTarget = { has: false, p1x: 0, p1y: 0, p1vx: 0, p1vy: 0, p2x: 0, p2y: 0 };
+// 加入方本地"预测子弹"：按下开枪键立刻在本地画一颗子弹当反馈，等房主的权威判定回来后再对齐/移除，
+// 避免每次开枪都要等一个网络来回才看到子弹飞出去，体感像"哑弹"
+let predictedBullets = [];
 const NET_STATE_INTERVAL_MS = 1000 / 30;
 const NET_POSE_INTERVAL_MS = 1000 / 45;
 const NET_MAX_BUFFERED_BYTES = 64 * 1024;
@@ -1499,7 +1516,7 @@ let processedGuestShots = new Set();
 function resetNetSyncState() {
   remoteInput = { up: false, down: false, left: false, right: false };
   remotePose = { has: false, x: 0, y: 0, vx: 0, vy: 0, seq: 0 };
-  netTarget = { has: false, p1x: 0, p1y: 0, p2x: 0, p2y: 0 };
+  netTarget = { has: false, p1x: 0, p1y: 0, p1vx: 0, p1vy: 0, p2x: 0, p2y: 0 };
   lastStateSentAt = 0;
   lastPoseSentAt = 0;
   poseSeq = 0;
@@ -1510,6 +1527,7 @@ function resetNetSyncState() {
   lastLocalShotAt = 0;
   pendingLocalRestartUntil = 0;
   processedGuestShots.clear();
+  predictedBullets = [];
 }
 
 function isNetInputCode(code) {
@@ -1689,6 +1707,28 @@ function tryGuestShoot() {
   updateHUD();
   lastLocalShotAt = now;
 
+  // 本地立刻画一颗"预测子弹"+ 枪口火花，不等房主确认，按键的瞬间就有反馈
+  predictedBullets.push({
+    shotId,
+    x: muzzleX, y: muzzleY,
+    vx: Math.cos(angle) * BASE_BULLET_SPEED * speedMult,
+    vy: Math.sin(angle) * BASE_BULLET_SPEED * speedMult,
+    bounces: 0,
+    owner: { color: p2.color },
+    spawnedAt: now,
+  });
+  for (let i = 0; i < 4; i++) {
+    const spread = (Math.random() - 0.5) * 0.6;
+    particles.push({
+      x: p2.x + Math.cos(angle) * (p2.radius + 6),
+      y: p2.y + Math.sin(angle) * (p2.radius + 6),
+      vx: Math.cos(angle + spread) * (2 + Math.random() * 2),
+      vy: Math.sin(angle + spread) * (2 + Math.random() * 2),
+      life: 8 + Math.random() * 6,
+      color: '#ffe082',
+    });
+  }
+
   wsSend({
     type: 'shot',
     seq: shotId,
@@ -1812,6 +1852,7 @@ function obstacleSyncKey() {
 function buildNetPlayer(player) {
   return {
     x: netNum(player.x), y: netNum(player.y),
+    vx: netNum(player.vx || 0), vy: netNum(player.vy || 0),
     hp: player.hp, alive: player.alive, hitFlash: player.hitFlash,
     ammo: player.ammo, reloading: player.reloading,
   };
@@ -1896,6 +1937,7 @@ function applyRemoteState(s) {
   Object.assign(p1, s.p1);
   Object.assign(p2, s.p2);
   netTarget.p1x = s.p1.x; netTarget.p1y = s.p1.y;
+  netTarget.p1vx = s.p1.vx || 0; netTarget.p1vy = s.p1.vy || 0;
   netTarget.p2x = s.p2.x; netTarget.p2y = s.p2.y;
   netTarget.has = true;
   // 蓝方是远端玩家：距离太大说明是重生/复位，直接瞬移；否则维持当前渲染位置等待插值。
@@ -1919,6 +1961,11 @@ function applyRemoteState(s) {
     ownerSide: b.ownerSide || null,
   }));
   bullets = authoritativeBullets;
+  // 权威子弹已经落地：把对应的本地预测子弹摘掉，避免同一发子弹画出两颗
+  if (predictedBullets.length) {
+    const confirmedShotIds = new Set(authoritativeBullets.filter(b => b.ownerSide === 'guest' && b.shotId).map(b => b.shotId));
+    predictedBullets = predictedBullets.filter(pb => !confirmedShotIds.has(pb.shotId));
+  }
   particles = s.particles.map(pt => ({ ...pt, vx: pt.vx || 0, vy: pt.vy || 0 }));
   floatingTexts = s.floatingTexts.map(t => ({ ...t, vy: t.vy || -0.8 }));
   healthPickup = s.healthPickup;
@@ -1953,10 +2000,26 @@ function tickRemoteVisuals() {
   const dt = Math.min(2, Math.max(0.25, (now - lastRemoteVisualAt) / (1000 / 60)));
   lastRemoteVisualAt = now;
 
+  // 房主的状态包被限流到 30fps 发送，两次快照之间用上一次的速度把追赶目标继续往前推，
+  // 插值才不会出现"追上就顿一下再等下一包"的卡顿感
+  if (netTarget.has) {
+    netTarget.p1x += (netTarget.p1vx || 0) * dt;
+    netTarget.p1y += (netTarget.p1vy || 0) * dt;
+  }
+
   for (let i = bullets.length - 1; i >= 0; i--) {
     const b = bullets[i];
     b.x += (b.vx || 0) * dt;
     b.y += (b.vy || 0) * dt;
+  }
+
+  // 本地预测子弹：按下开枪键起就自己飞，直到房主的权威子弹落地顶替它（或超时兜底清掉）
+  for (let i = predictedBullets.length - 1; i >= 0; i--) {
+    const pb = predictedBullets[i];
+    pb.x += pb.vx * dt;
+    pb.y += pb.vy * dt;
+    const outOfBounds = pb.x < -20 || pb.x > W + 20 || pb.y < -20 || pb.y > H + 20;
+    if (outOfBounds || now - pb.spawnedAt > 900) predictedBullets.splice(i, 1);
   }
 
   for (let i = particles.length - 1; i >= 0; i--) {
