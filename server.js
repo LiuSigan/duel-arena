@@ -40,8 +40,8 @@ function otherPeer(ws) {
 }
 
 function startMatch(room) {
-  send(room.host, { type: 'start', role: 'host' });
-  send(room.guest, { type: 'start', role: 'guest' });
+  send(room.host, { type: 'start', role: 'host', config: room.config });
+  send(room.guest, { type: 'start', role: 'guest', config: room.config });
 }
 
 wss.on('connection', (ws) => {
@@ -55,7 +55,7 @@ wss.on('connection', (ws) => {
       // ---- 创建私人房间 ----
       case 'create': {
         const code = makeCode();
-        rooms.set(code, { host: ws, guest: null });
+        rooms.set(code, { host: ws, guest: null, config: msg.config || null });
         ws.roomCode = code;
         send(ws, { type: 'room', code });
         break;
@@ -77,13 +77,14 @@ wss.on('connection', (ws) => {
       case 'quickmatch': {
         if (waitingPlayer && waitingPlayer !== ws && waitingPlayer.readyState === ws.OPEN) {
           const code = makeCode();
-          const room = { host: waitingPlayer, guest: ws };
+          const room = { host: waitingPlayer, guest: ws, config: waitingPlayer.config || null };
           rooms.set(code, room);
           waitingPlayer.roomCode = code;
           ws.roomCode = code;
           waitingPlayer = null;
           startMatch(room);
         } else {
+          ws.config = msg.config || null;
           waitingPlayer = ws;
           send(ws, { type: 'waiting' });
         }

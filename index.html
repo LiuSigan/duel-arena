@@ -179,7 +179,7 @@
     color: #888;
     margin-top: 6px;
   }
-  .speed-btn {
+  .option-btn {
     padding: 10px 18px;
     font-size: 14px;
     background: #1c1c30;
@@ -189,23 +189,24 @@
     cursor: pointer;
     font-weight: bold;
     transition: all 0.15s;
-    min-width: 120px;
+    min-width: 150px;
   }
-  .speed-btn .sub {
+  .option-btn .sub {
     display: block;
     font-size: 10px;
     font-weight: normal;
     color: #777;
     margin-top: 4px;
   }
-  .speed-btn:hover { border-color: #666; }
-  .speed-btn.selected {
+  .option-btn:hover { border-color: #666; }
+  .option-btn.selected {
     border-color: #ffcc66;
     background: #2c2740;
     color: #ffcc66;
     box-shadow: 0 0 12px rgba(255,204,102,0.25);
   }
-  .speed-btn.selected .sub { color: #d4b26a; }
+  .option-btn.selected .sub { color: #d4b26a; }
+  #speedSlider { width: 260px; accent-color: #ffcc66; cursor: pointer; }
 </style>
 </head>
 <body>
@@ -253,10 +254,19 @@
   <p>子弹碰到墙壁和边界会反弹，最多反弹 5 次后消失</p>
   <div id="speedSelect" style="margin-top:22px;">
     <div style="font-size:14px; color:#aaa; margin-bottom:10px;">🎚 游戏速度 <span style="font-size:11px; color:#666;">(影响移动和子弹，联机时以房主设置为准)</span></div>
+    <div style="display:flex; align-items:center; gap:14px; justify-content:center;">
+      <span style="font-size:12px; color:#777;">🐢 慢</span>
+      <input type="range" id="speedSlider" min="0.6" max="1.8" step="0.05" value="1">
+      <span style="font-size:12px; color:#777;">快 ⚡</span>
+      <span id="speedValue" style="min-width:52px; color:#ffcc66; font-weight:bold; font-size:14px;">1.00x</span>
+    </div>
+  </div>
+
+  <div id="mapSelect" style="margin-top:22px;">
+    <div style="font-size:14px; color:#aaa; margin-bottom:10px;">🗺 选择地图 <span style="font-size:11px; color:#666;">(联机时以房主选择为准)</span></div>
     <div style="display:flex; gap:10px; justify-content:center;">
-      <button class="speed-btn" data-speed="0.75">🐢 慢速<span class="sub">节奏舒缓，适合新手</span></button>
-      <button class="speed-btn selected" data-speed="1">⚖️ 标准<span class="sub">默认平衡手感</span></button>
-      <button class="speed-btn" data-speed="1.3">⚡ 快速<span class="sub">反应拉满，刺激</span></button>
+      <button class="option-btn selected" data-map="classic">🏰 经典擂台<span class="sub">四角堡垒 + 之字通道，攻防均衡</span></button>
+      <button class="option-btn" data-map="outpost">🌉 旷野哨站<span class="sub">开阔通道 + 中心孤堡，适合远程狙杀</span></button>
     </div>
   </div>
   <div class="mode-select" id="modeSelect">
@@ -315,12 +325,11 @@ let speedMult = 1;
 const BASE_PLAYER_SPEED = 6.0;
 const BASE_AI_SPEED = 5.8;
 const BASE_BULLET_SPEED = 9;
-document.querySelectorAll('.speed-btn').forEach(btn => {
-  btn.addEventListener('click', () => {
-    document.querySelectorAll('.speed-btn').forEach(b => b.classList.remove('selected'));
-    btn.classList.add('selected');
-    speedMult = parseFloat(btn.dataset.speed);
-  });
+const speedSlider = document.getElementById('speedSlider');
+const speedValueEl = document.getElementById('speedValue');
+speedSlider.addEventListener('input', () => {
+  speedMult = parseFloat(speedSlider.value);
+  speedValueEl.textContent = speedMult.toFixed(2) + 'x';
 });
 
 // AI 获胜（玩家落败）时显示的嘲讽台词，随机抽一条
@@ -345,36 +354,72 @@ function pickRandom(arr) {
   return arr[Math.floor(Math.random() * arr.length)];
 }
 
-// ---------- 障碍物（掩体）：转角堡垒 + 之字形通道 + 中心决斗点，制造迂回和埋伏点 ----------
-const obstacles = [
-  // 四角 L 型堡垒，保护出生点又不完全挡视线
-  {x: 30,  y: 30,  w: 80, h: 22},
-  {x: 30,  y: 30,  w: 22, h: 80},
-  {x: 790, y: 30,  w: 80, h: 22},
-  {x: 868, y: 30,  w: 22, h: 80},
-  {x: 30,  y: 468, w: 80, h: 22},
-  {x: 30,  y: 410, w: 22, h: 80},
-  {x: 790, y: 468, w: 80, h: 22},
-  {x: 868, y: 410, w: 22, h: 80},
+// ---------- 地图数据：每张地图有自己的障碍物布局和医疗包刷新点 ----------
+const MAPS = {
+  // 经典擂台：转角堡垒 + 之字形通道 + 中心决斗点，制造迂回和埋伏点
+  classic: {
+    label: '经典擂台',
+    obstacles: [
+      // 四角 L 型堡垒，保护出生点又不完全挡视线
+      {x: 30,  y: 30,  w: 80, h: 22},
+      {x: 30,  y: 30,  w: 22, h: 80},
+      {x: 790, y: 30,  w: 80, h: 22},
+      {x: 868, y: 30,  w: 22, h: 80},
+      {x: 30,  y: 468, w: 80, h: 22},
+      {x: 30,  y: 410, w: 22, h: 80},
+      {x: 790, y: 468, w: 80, h: 22},
+      {x: 868, y: 410, w: 22, h: 80},
 
-  // 之字形侧翼墙，制造包抄路线和视线遮挡
-  {x: 260, y: 90,  w: 24, h: 130},
-  {x: 616, y: 90,  w: 24, h: 130},
-  {x: 260, y: 300, w: 24, h: 130},
-  {x: 616, y: 300, w: 24, h: 130},
+      // 之字形侧翼墙，制造包抄路线和视线遮挡
+      {x: 260, y: 90,  w: 24, h: 130},
+      {x: 616, y: 90,  w: 24, h: 130},
+      {x: 260, y: 300, w: 24, h: 130},
+      {x: 616, y: 300, w: 24, h: 130},
 
-  // 中心十字掩体：核心决斗点，四面都能绕
-  {x: 430, y: 200, w: 40, h: 120},
-  {x: 400, y: 230, w: 100, h: 60},
-];
+      // 中心十字掩体：核心决斗点，四面都能绕
+      {x: 430, y: 200, w: 40, h: 120},
+      {x: 400, y: 230, w: 100, h: 60},
+    ],
+    pickupSpots: [
+      {x: 450, y: 130},
+      {x: 450, y: 390},
+      {x: 170, y: 260},
+      {x: 730, y: 260},
+    ],
+  },
+  // 旷野哨站：上下各留一条中央大通道，视野更开阔，适合远程对狙
+  outpost: {
+    label: '旷野哨站',
+    obstacles: [
+      {x: 0,   y: 150, w: 340, h: 24},
+      {x: 560, y: 150, w: 340, h: 24},
+      {x: 0,   y: 350, w: 340, h: 24},
+      {x: 560, y: 350, w: 340, h: 24},
+      {x: 438, y: 210, w: 24, h: 100},
+    ],
+    pickupSpots: [
+      {x: 450, y: 70},
+      {x: 450, y: 450},
+      {x: 170, y: 260},
+      {x: 730, y: 260},
+    ],
+  },
+};
+let currentMapKey = 'classic';
+let obstacles = MAPS[currentMapKey].obstacles;
+let PICKUP_SPOTS = MAPS[currentMapKey].pickupSpots;
 
-// ---------- 医疗包刷新点（四个开阔位置，随机刷新一个） ----------
-const PICKUP_SPOTS = [
-  {x: 450, y: 130},
-  {x: 450, y: 390},
-  {x: 170, y: 260},
-  {x: 730, y: 260},
-];
+function setMap(key) {
+  if (!MAPS[key]) return;
+  currentMapKey = key;
+  obstacles = MAPS[key].obstacles;
+  PICKUP_SPOTS = MAPS[key].pickupSpots;
+  document.querySelectorAll('#mapSelect .option-btn').forEach(b => b.classList.toggle('selected', b.dataset.map === key));
+}
+document.querySelectorAll('#mapSelect .option-btn').forEach(btn => {
+  btn.addEventListener('click', () => setMap(btn.dataset.map));
+});
+
 let healthPickup = null;
 let pickupRespawnTimer = 150;
 const PICKUP_HEAL = 30;
@@ -1276,6 +1321,12 @@ function handleServerMsg(msg) {
       document.getElementById('quickStatus').textContent = '⏳ 匹配中…把网址发给朋友，对方点"开始匹配"即可配对';
       break;
     case 'start':
+      if (msg.config) {
+        speedMult = msg.config.speed;
+        speedSlider.value = speedMult;
+        speedValueEl.textContent = speedMult.toFixed(2) + 'x';
+        setMap(msg.config.map);
+      }
       startGame(msg.role === 'host' ? 'online-host' : 'online-guest');
       break;
     case 'error':
@@ -1309,7 +1360,7 @@ document.getElementById('quickBtn').addEventListener('click', () => {
   document.getElementById('quickBtn').disabled = true;
   document.getElementById('quickStatus').textContent = '正在连接服务器…';
   ensureWS(
-    () => wsSend({ type: 'quickmatch' }),
+    () => wsSend({ type: 'quickmatch', config: { speed: speedMult, map: currentMapKey } }),
     () => {
       document.getElementById('quickStatus').textContent = '❌ 无法连接服务器，请刷新重试';
       document.getElementById('quickBtn').disabled = false;
@@ -1320,7 +1371,7 @@ document.getElementById('quickBtn').addEventListener('click', () => {
 document.getElementById('hostBtn').addEventListener('click', () => {
   document.getElementById('hostBtn').disabled = true;
   ensureWS(
-    () => wsSend({ type: 'create' }),
+    () => wsSend({ type: 'create', config: { speed: speedMult, map: currentMapKey } }),
     () => {
       document.getElementById('hostStatus').style.display = 'block';
       document.getElementById('hostStatus').textContent = '❌ 无法连接服务器，请刷新重试';
