@@ -165,6 +165,7 @@ wss.on('connection', (ws) => {
       // ---- 控制/房间指令：保持即时转发 ----
       case 'input':
       case 'shot':
+      case 'hit':
       case 'restart':
       case 'resetMatch': {
         const peer = otherPeer(ws);

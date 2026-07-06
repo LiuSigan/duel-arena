@@ -636,6 +636,9 @@ function resetRound() {
   healthPickup = null;
   pickupRespawnTimer = 150;
   shakeTimer = 0;
+  lastLocalShotAt = 0;
+  lastPredictedHitAt = 0;
+  resolvedRemoteShots.clear();
   roundOver = false;
   document.getElementById('overlay').classList.remove('show');
   document.getElementById('matchEndPanel').style.display = 'none';
@@ -669,6 +672,11 @@ function updateHUD() {
   document.getElementById('score2').textContent = score2;
   renderAmmo(p1, 'ammoDots1', 'reloadText1');
   renderAmmo(p2, 'ammoDots2', 'reloadText2');
+}
+
+function updateAimTargets() {
+  p1.aimTargetX = p2.x; p1.aimTargetY = p2.y;
+  p2.aimTargetX = p1.x; p2.aimTargetY = p1.y;
 }
 
 // ---------- 输入 ----------
@@ -729,12 +737,12 @@ function segmentBlocked(x1, y1, x2, y2) {
 }
 
 // ---------- 射击 ----------
-function shoot(player, target, aimPoint) {
+function shoot(player, target, aimPoint, opts = {}) {
   if (player.cooldown > 0 || !player.alive) return false;
   if (player.reloading || player.ammo <= 0) return false; // 弹匣打空，必须先装弹
   const aim = aimPoint || target;
   const angle = Math.atan2(aim.y - player.y, aim.x - player.x);
-  bullets.push({
+  const bullet = {
     x: player.x + Math.cos(angle) * (player.radius + 2),
     y: player.y + Math.sin(angle) * (player.radius + 2),
     vx: Math.cos(angle) * BASE_BULLET_SPEED * speedMult,
@@ -742,7 +750,13 @@ function shoot(player, target, aimPoint) {
     owner: player,
     target: target,
     bounces: 0,
-  });
+    shotId: opts.shotId || null,
+    ownerSide: opts.ownerSide || (player === p1 ? 'p1' : 'p2'),
+    predictedGuest: !!opts.predictedGuest,
+    predictedUntil: opts.predictedUntil || 0,
+    hitReported: false,
+  };
+  bullets.push(bullet);
   player.cooldown = 5;
   player.ammo--;
   updateHUD();
@@ -761,7 +775,7 @@ function shoot(player, target, aimPoint) {
     player.reloading = true;
     player.reloadTimer = RELOAD_DURATION;
   }
-  return true;
+  return bullet;
 }
 
 // 每帧推进装弹进度
@@ -960,11 +974,36 @@ function getHitPart(bullet, target, angle) {
   return null;
 }
 
-function applyDamage(target, part) {
+function getSweptHit(bullet, target, prevX, prevY) {
+  const aimX = Number.isFinite(target.aimTargetX) ? target.aimTargetX : (target === p1 ? p2.x : p1.x);
+  const aimY = Number.isFinite(target.aimTargetY) ? target.aimTargetY : (target === p1 ? p2.y : p1.y);
+  const angle = Math.atan2(aimY - target.y, aimX - target.x);
+  const dist = Math.hypot(bullet.x - prevX, bullet.y - prevY);
+  const steps = Math.max(1, Math.ceil(dist / 3));
+  for (let i = 1; i <= steps; i++) {
+    const t = i / steps;
+    const probe = {
+      x: prevX + (bullet.x - prevX) * t,
+      y: prevY + (bullet.y - prevY) * t,
+    };
+    const part = getHitPart(probe, target, angle);
+    if (part) return { part, x: probe.x, y: probe.y };
+  }
+  return null;
+}
+
+function damageForPart(part) {
   let dmg = 0;
   if (part === 'head') dmg = 100;
   else if (part === 'body') dmg = 50;
   else if (part === 'limb') dmg = 30;
+  else dmg = 0;
+  return dmg;
+}
+
+function applyDamage(target, part) {
+  const dmg = damageForPart(part);
+  if (dmg <= 0) return;
   target.hp -= dmg;
   target.hitFlash = 8;
   spawnParticles(target.x, target.y, target.color, part);
@@ -976,6 +1015,19 @@ function applyDamage(target, part) {
     target.alive = false;
     endRound(target === p1 ? p2 : p1);
   }
+  updateHUD();
+}
+
+function applyPredictedDamage(target, part) {
+  const dmg = damageForPart(part);
+  if (dmg <= 0 || !target.alive) return;
+  target.hp = Math.max(0, target.hp - dmg);
+  target.hitFlash = 8;
+  spawnParticles(target.x, target.y, target.color, part);
+  const label = part === 'head' ? `爆头 -${dmg}` : `-${dmg}`;
+  spawnFloatingText(target.x, target.y - 20, label, part === 'head' ? '#ffd54f' : '#ffffff');
+  triggerShake(part === 'head' ? 7 : part === 'body' ? 4 : 2);
+  lastPredictedHitAt = performance.now();
   updateHUD();
 }
 
@@ -1115,10 +1167,12 @@ function update() {
     }
 
     if (b.target.alive) {
-      const angle = Math.atan2(b.target.aimTargetY - b.target.y, b.target.aimTargetX - b.target.x);
-      const part = getHitPart(b, b.target, angle);
-      if (part) {
-        applyDamage(b.target, part);
+      const hit = getSweptHit(b, b.target, prevX, prevY);
+      if (hit) {
+        b.x = hit.x;
+        b.y = hit.y;
+        if (b.shotId && b.ownerSide === 'guest') resolvedRemoteShots.add(b.shotId);
+        applyDamage(b.target, hit.part);
         bullets.splice(i, 1);
       }
     }
@@ -1176,8 +1230,7 @@ function update() {
   // 屏幕震动衰减
   if (shakeTimer > 0) shakeTimer--;
 
-  p1.aimTargetX = p2.x; p1.aimTargetY = p2.y;
-  p2.aimTargetX = p1.x; p2.aimTargetY = p1.y;
+  updateAimTargets();
 
   if (netMode === 'host') {
     broadcastState();
@@ -1401,6 +1454,7 @@ function loop() {
       p1.x += (netTarget.p1x - p1.x) * NET_REMOTE_INTERP_ALPHA;
       p1.y += (netTarget.p1y - p1.y) * NET_REMOTE_INTERP_ALPHA;
     }
+    updateAimTargets();
     tickRemoteVisuals();
   } else {
     update();
@@ -1448,7 +1502,9 @@ let lastRemoteVisualAt = performance.now();
 let lastObstacleSyncKey = '';
 let lastObstacleSyncAt = 0;
 let lastLocalShotAt = 0;
+let lastPredictedHitAt = 0;
 let pendingLocalRestartUntil = 0;
+let resolvedRemoteShots = new Set();
 
 function resetNetSyncState() {
   remoteInput = { up: false, down: false, left: false, right: false };
@@ -1462,7 +1518,9 @@ function resetNetSyncState() {
   lastObstacleSyncKey = '';
   lastObstacleSyncAt = 0;
   lastLocalShotAt = 0;
+  lastPredictedHitAt = 0;
   pendingLocalRestartUntil = 0;
+  resolvedRemoteShots.clear();
 }
 
 function isNetInputCode(code) {
@@ -1545,6 +1603,9 @@ function handleServerMsg(msg) {
     case 'shot':
       handleGuestShot(msg);
       break;
+    case 'hit':
+      handleGuestHit(msg);
+      break;
     case 'state':
       applyRemoteState(msg.state);
       break;
@@ -1625,14 +1686,32 @@ function sendGuestPose(force = false) {
 
 function tryGuestShoot() {
   if (netMode !== 'guest' || !gameRunning || roundOver || !p2 || !p2.alive) return;
-  const beforeBulletCount = bullets.length;
-  if (!shoot(p2, p1)) return;
-  lastLocalShotAt = performance.now();
-  for (let i = beforeBulletCount; i < bullets.length; i++) {
-    bullets[i].predictedGuest = true;
-    bullets[i].predictedUntil = lastLocalShotAt + 700;
-  }
-  wsSend({ type: 'shot', seq: ++shotSeq, pose: buildGuestPose() });
+  const shotId = ++shotSeq;
+  const now = performance.now();
+  const bullet = shoot(p2, p1, null, {
+    shotId,
+    ownerSide: 'guest',
+    predictedGuest: true,
+    predictedUntil: now + 700,
+  });
+  if (!bullet) return;
+  lastLocalShotAt = now;
+  wsSend({ type: 'shot', seq: shotId, pose: buildGuestPose() });
+}
+
+function reportGuestHit(bullet, hit) {
+  if (netMode !== 'guest' || !bullet.predictedGuest || bullet.hitReported) return;
+  bullet.hitReported = true;
+  wsSend({
+    type: 'hit',
+    shooter: 'guest',
+    target: 'p1',
+    shotId: bullet.shotId,
+    part: hit.part,
+    x: netNum(hit.x),
+    y: netNum(hit.y),
+    pose: buildGuestPose(),
+  });
 }
 
 function tickGuestOwnedWeapon() {
@@ -1705,6 +1784,7 @@ function updateRemoteGuestPlayer() {
 
 function handleGuestShot(msg) {
   if (netMode !== 'host' || !gameRunning || roundOver) return;
+  if (msg.seq && resolvedRemoteShots.has(msg.seq)) return;
   if (msg.pose) {
     receiveGuestPose(msg.pose);
     if (remotePose.has) {
@@ -1712,7 +1792,24 @@ function handleGuestShot(msg) {
       p2.y = remotePose.y;
     }
   }
-  shoot(p2, p1);
+  shoot(p2, p1, null, { shotId: msg.seq || null, ownerSide: 'guest' });
+}
+
+function handleGuestHit(msg) {
+  if (netMode !== 'host' || !gameRunning || roundOver) return;
+  if (msg.shooter !== 'guest' || msg.target !== 'p1' || !msg.shotId) return;
+  if (resolvedRemoteShots.has(msg.shotId)) return;
+  if (!p1.alive) return;
+
+  const hitX = Number.isFinite(msg.x) ? msg.x : p1.x;
+  const hitY = Number.isFinite(msg.y) ? msg.y : p1.y;
+  if (Math.hypot(hitX - p1.x, hitY - p1.y) > 120) return;
+
+  const part = ['head', 'body', 'limb'].includes(msg.part) ? msg.part : 'body';
+  resolvedRemoteShots.add(msg.shotId);
+  bullets = bullets.filter(b => !(b.shotId === msg.shotId && b.ownerSide === 'guest'));
+  applyDamage(p1, part);
+  broadcastState(true);
 }
 
 function netNum(n) {
@@ -1752,6 +1849,8 @@ function buildState(force = false) {
       vx: netNum(b.vx || 0), vy: netNum(b.vy || 0),
       bounces: b.bounces || 0,
       ownerColor: b.owner.color,
+      shotId: b.shotId || null,
+      ownerSide: b.ownerSide || null,
     })),
     particles: particles.slice(-40).map(pt => ({
       x: netNum(pt.x), y: netNum(pt.y),
@@ -1800,6 +1899,7 @@ function applyRemoteState(s) {
 
   // 保留当前渲染坐标，把网络包里的最新坐标记为插值目标，渲染循环里平滑逼近
   const r1x = p1.x, r1y = p1.y;
+  const localP1 = { hp: p1.hp, hitFlash: p1.hitFlash };
   const localP2 = {
     x: p2.x, y: p2.y, vx: p2.vx, vy: p2.vy,
     ammo: p2.ammo, reloading: p2.reloading, reloadTimer: p2.reloadTimer, cooldown: p2.cooldown,
@@ -1815,6 +1915,10 @@ function applyRemoteState(s) {
   netTarget.has = true;
   // 蓝方是远端玩家：距离太大说明是重生/复位，直接瞬移；否则维持当前渲染位置等待插值。
   if (Math.hypot(s.p1.x - r1x, s.p1.y - r1y) < 80) { p1.x = r1x; p1.y = r1y; }
+  if (netMode === 'guest' && now - lastPredictedHitAt < 700 && localP1.hp < p1.hp) {
+    p1.hp = localP1.hp;
+    p1.hitFlash = Math.max(p1.hitFlash || 0, localP1.hitFlash || 0);
+  }
   // 红方是本机玩家：活动回合中不吃房主回传坐标，避免网络校正把角色来回拽。
   if (netMode === 'guest' && s.p2.alive && !s.roundOver && !wasRoundOver) {
     p2.x = localP2.x; p2.y = localP2.y;
@@ -1830,13 +1934,15 @@ function applyRemoteState(s) {
     x: b.x, y: b.y, vx: b.vx || 0, vy: b.vy || 0,
     bounces: b.bounces,
     owner: { color: b.ownerColor },
+    shotId: b.shotId || null,
+    ownerSide: b.ownerSide || null,
   }));
   bullets = authoritativeBullets;
   if (predictedGuestBullets.length > 0) {
     for (const predicted of predictedGuestBullets) {
       const matched = authoritativeBullets.some(b =>
-        b.owner.color === predicted.owner.color &&
-        Math.hypot(b.x - predicted.x, b.y - predicted.y) < 160
+        (b.shotId && b.shotId === predicted.shotId) ||
+        (b.owner.color === predicted.owner.color && Math.hypot(b.x - predicted.x, b.y - predicted.y) < 160)
       );
       if (!matched) bullets.push(predicted);
     }
@@ -1875,9 +1981,21 @@ function tickRemoteVisuals() {
   const dt = Math.min(2, Math.max(0.25, (now - lastRemoteVisualAt) / (1000 / 60)));
   lastRemoteVisualAt = now;
 
-  for (const b of bullets) {
+  for (let i = bullets.length - 1; i >= 0; i--) {
+    const b = bullets[i];
+    const prevX = b.x, prevY = b.y;
     b.x += (b.vx || 0) * dt;
     b.y += (b.vy || 0) * dt;
+    if (b.predictedGuest && b.target && b.target.alive && !b.hitReported) {
+      const hit = getSweptHit(b, b.target, prevX, prevY);
+      if (hit) {
+        b.x = hit.x;
+        b.y = hit.y;
+        applyPredictedDamage(b.target, hit.part);
+        reportGuestHit(b, hit);
+        bullets.splice(i, 1);
+      }
+    }
   }
 
   for (let i = particles.length - 1; i >= 0; i--) {
