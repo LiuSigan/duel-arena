@@ -678,7 +678,8 @@ window.addEventListener('keydown', (e) => {
   keys[e.code] = true;
   if (e.code === 'Space' || e.code === 'Enter') e.preventDefault();
   if (netMode === 'guest') {
-    if (!wasPressed && isNetInputCode(e.code)) sendGuestInput(true);
+    if (!wasPressed && isNetInputCode(e.code)) sendGuestPose(true);
+    if (!wasPressed && e.code === 'Space') sendGuestShot();
     if (e.code === 'KeyR' && roundOver) wsSend({ type: matchOver ? 'resetMatch' : 'restart' });
     if (e.code === 'KeyT' && roundOver) wsSend({ type: 'resetMatch' });
   } else {
@@ -689,7 +690,7 @@ window.addEventListener('keydown', (e) => {
 window.addEventListener('keyup', (e) => {
   const wasPressed = !!keys[e.code];
   keys[e.code] = false;
-  if (netMode === 'guest' && wasPressed && isNetInputCode(e.code)) sendGuestInput(true);
+  if (netMode === 'guest' && wasPressed && isNetInputCode(e.code)) sendGuestPose(true);
 });
 
 // ---------- 碰撞辅助（移动用，圆 vs 矩形） ----------
@@ -1044,24 +1045,20 @@ function update() {
   if (p2.isAI) {
     runAI(p2, p1);
   } else {
-    const prevP2X = p2.x, prevP2Y = p2.y;
-    let dx2 = 0, dy2 = 0;
     if (netMode === 'host') {
-      if (remoteInput.up) dy2 -= 1;
-      if (remoteInput.down) dy2 += 1;
-      if (remoteInput.left) dx2 -= 1;
-      if (remoteInput.right) dx2 += 1;
+      updateRemoteGuestPlayer();
     } else {
+      const prevP2X = p2.x, prevP2Y = p2.y;
+      let dx2 = 0, dy2 = 0;
       if (keys['ArrowUp']) dy2 -= 1;
       if (keys['ArrowDown']) dy2 += 1;
       if (keys['ArrowLeft']) dx2 -= 1;
       if (keys['ArrowRight']) dx2 += 1;
+      const len2 = Math.hypot(dx2, dy2) || 1;
+      tryMove(p2, (dx2/len2) * BASE_PLAYER_SPEED * speedMult, (dy2/len2) * BASE_PLAYER_SPEED * speedMult);
+      p2.vx = p2.x - prevP2X; p2.vy = p2.y - prevP2Y;
+      if (keys['Enter']) shoot(p2, p1);
     }
-    const len2 = Math.hypot(dx2, dy2) || 1;
-    tryMove(p2, (dx2/len2) * BASE_PLAYER_SPEED * speedMult, (dy2/len2) * BASE_PLAYER_SPEED * speedMult);
-    p2.vx = p2.x - prevP2X; p2.vy = p2.y - prevP2Y;
-    const shootPressed2 = netMode === 'host' ? remoteInput.shoot : keys['Enter'];
-    if (shootPressed2) shoot(p2, p1);
   }
 
   for (let i = bullets.length - 1; i >= 0; i--) {
@@ -1394,13 +1391,12 @@ function draw() {
 
 function loop() {
   if (netMode === 'guest') {
-    sendGuestInput();
-    predictGuestPlayer();
-    // 插值：远端蓝方平滑追随网络坐标；本地红方先预测，再用房主权威坐标轻微纠偏。
+    updateGuestOwnedPlayer();
+    sendGuestPose();
+    // 蓝方是远端玩家，平滑追随房主状态；红方是本机玩家，不再被房主坐标拉扯。
     if (netTarget.has) {
       p1.x += (netTarget.p1x - p1.x) * NET_REMOTE_INTERP_ALPHA;
       p1.y += (netTarget.p1y - p1.y) * NET_REMOTE_INTERP_ALPHA;
-      reconcileGuestPrediction();
     }
     tickRemoteVisuals();
   } else {
@@ -1434,28 +1430,29 @@ document.getElementById('pveBtn').addEventListener('click', () => startGame('pve
 // ---------- 联机对战（WebSocket 连接本站服务器，自动匹配或房间号配对） ----------
 let netMode = null; // null | 'host' | 'guest'
 let ws = null;
-let remoteInput = { up: false, down: false, left: false, right: false, shoot: false };
+let remoteInput = { up: false, down: false, left: false, right: false };
+let remotePose = { has: false, x: 0, y: 0, vx: 0, vy: 0, seq: 0 };
 let netTarget = { has: false, p1x: 0, p1y: 0, p2x: 0, p2y: 0 };
 const NET_STATE_INTERVAL_MS = 1000 / 30;
-const NET_INPUT_HEARTBEAT_MS = 250;
+const NET_POSE_INTERVAL_MS = 1000 / 45;
 const NET_MAX_BUFFERED_BYTES = 64 * 1024;
 const NET_REMOTE_INTERP_ALPHA = 0.42;
-const NET_OWN_RECONCILE_ALPHA = 0.12;
-const NET_OWN_SNAP_DISTANCE = 90;
 let lastStateSentAt = 0;
-let lastInputSentAt = 0;
-let lastInputPayload = '';
-let inputSeq = 0;
+let lastPoseSentAt = 0;
+let poseSeq = 0;
+let shotSeq = 0;
 let lastRemoteVisualAt = performance.now();
 let lastObstacleSyncKey = '';
 let lastObstacleSyncAt = 0;
 
 function resetNetSyncState() {
-  remoteInput = { up: false, down: false, left: false, right: false, shoot: false };
+  remoteInput = { up: false, down: false, left: false, right: false };
+  remotePose = { has: false, x: 0, y: 0, vx: 0, vy: 0, seq: 0 };
   netTarget = { has: false, p1x: 0, p1y: 0, p2x: 0, p2y: 0 };
   lastStateSentAt = 0;
-  lastInputSentAt = 0;
-  lastInputPayload = '';
+  lastPoseSentAt = 0;
+  poseSeq = 0;
+  shotSeq = 0;
   lastRemoteVisualAt = performance.now();
   lastObstacleSyncKey = '';
   lastObstacleSyncAt = 0;
@@ -1535,6 +1532,12 @@ function handleServerMsg(msg) {
     case 'input':
       remoteInput = msg.input;
       break;
+    case 'pose':
+      receiveGuestPose(msg.pose);
+      break;
+    case 'shot':
+      handleGuestShot(msg);
+      break;
     case 'state':
       applyRemoteState(msg.state);
       break;
@@ -1594,26 +1597,31 @@ function getGuestInput() {
   return {
     up: !!keys['KeyW'], down: !!keys['KeyS'],
     left: !!keys['KeyA'], right: !!keys['KeyD'],
-    shoot: !!keys['Space'],
   };
 }
 
-function sendGuestInput(force = false) {
-  if (netMode !== 'guest') return;
-  const now = performance.now();
-  const input = getGuestInput();
-  const payload = JSON.stringify(input);
-  const changed = payload !== lastInputPayload;
-  if (!force && !changed && now - lastInputSentAt < NET_INPUT_HEARTBEAT_MS) return;
-  if (!force && changed && now - lastInputSentAt < 16) return;
-
-  if (wsSend({ type: 'input', input, seq: ++inputSeq, clientTime: Math.round(now) })) {
-    lastInputPayload = payload;
-    lastInputSentAt = now;
-  }
+function buildGuestPose() {
+  return {
+    x: netNum(p2.x), y: netNum(p2.y),
+    vx: netNum(p2.vx || 0), vy: netNum(p2.vy || 0),
+    seq: ++poseSeq,
+    clientTime: Math.round(performance.now()),
+  };
 }
 
-function predictGuestPlayer() {
+function sendGuestPose(force = false) {
+  if (netMode !== 'guest' || !p2) return;
+  const now = performance.now();
+  if (!force && now - lastPoseSentAt < NET_POSE_INTERVAL_MS) return;
+  if (wsSend({ type: 'pose', pose: buildGuestPose() })) lastPoseSentAt = now;
+}
+
+function sendGuestShot() {
+  if (netMode !== 'guest' || !gameRunning || roundOver || !p2 || !p2.alive) return;
+  wsSend({ type: 'shot', seq: ++shotSeq, pose: buildGuestPose() });
+}
+
+function updateGuestOwnedPlayer() {
   if (!gameRunning || roundOver || !p2 || !p2.alive) return;
   const prevX = p2.x, prevY = p2.y;
   const input = getGuestInput();
@@ -1631,17 +1639,49 @@ function predictGuestPlayer() {
   p2.vy = p2.y - prevY;
 }
 
-function reconcileGuestPrediction() {
-  const dx = netTarget.p2x - p2.x;
-  const dy = netTarget.p2y - p2.y;
+function receiveGuestPose(pose) {
+  if (netMode !== 'host' || !pose || !Number.isFinite(pose.x) || !Number.isFinite(pose.y)) return;
+  if ((pose.seq || 0) < (remotePose.seq || 0)) return;
+  remotePose = {
+    has: true,
+    x: Math.max(p2.radius, Math.min(W - p2.radius, pose.x)),
+    y: Math.max(p2.radius, Math.min(H - p2.radius, pose.y)),
+    vx: Number.isFinite(pose.vx) ? pose.vx : 0,
+    vy: Number.isFinite(pose.vy) ? pose.vy : 0,
+    seq: pose.seq || remotePose.seq || 0,
+  };
+}
+
+function updateRemoteGuestPlayer() {
+  if (!remotePose.has || !p2.alive) return;
+  const beforeX = p2.x, beforeY = p2.y;
+  const dx = remotePose.x - p2.x;
+  const dy = remotePose.y - p2.y;
   const drift = Math.hypot(dx, dy);
-  if (drift > NET_OWN_SNAP_DISTANCE || roundOver || !p2.alive) {
-    p2.x = netTarget.p2x;
-    p2.y = netTarget.p2y;
+  if (drift > 120) {
+    p2.x = remotePose.x;
+    p2.y = remotePose.y;
   } else {
-    p2.x += dx * NET_OWN_RECONCILE_ALPHA;
-    p2.y += dy * NET_OWN_RECONCILE_ALPHA;
+    p2.x += dx * 0.45 + remotePose.vx * 0.55;
+    p2.y += dy * 0.45 + remotePose.vy * 0.55;
   }
+  p2.x = Math.max(p2.radius, Math.min(W - p2.radius, p2.x));
+  p2.y = Math.max(p2.radius, Math.min(H - p2.radius, p2.y));
+  if (MAPS[currentMapKey].dynamic) resolveObstacleOverlap(p2);
+  p2.vx = p2.x - beforeX;
+  p2.vy = p2.y - beforeY;
+}
+
+function handleGuestShot(msg) {
+  if (netMode !== 'host' || !gameRunning || roundOver) return;
+  if (msg.pose) {
+    receiveGuestPose(msg.pose);
+    if (remotePose.has) {
+      p2.x = remotePose.x;
+      p2.y = remotePose.y;
+    }
+  }
+  shoot(p2, p1);
 }
 
 function netNum(n) {
@@ -1724,15 +1764,21 @@ function broadcastState(force = false) {
 
 function applyRemoteState(s) {
   // 保留当前渲染坐标，把网络包里的最新坐标记为插值目标，渲染循环里平滑逼近
-  const r1x = p1.x, r1y = p1.y, r2x = p2.x, r2y = p2.y;
+  const r1x = p1.x, r1y = p1.y;
+  const localP2 = { x: p2.x, y: p2.y, vx: p2.vx, vy: p2.vy };
+  const wasRoundOver = roundOver;
   Object.assign(p1, s.p1);
   Object.assign(p2, s.p2);
   netTarget.p1x = s.p1.x; netTarget.p1y = s.p1.y;
   netTarget.p2x = s.p2.x; netTarget.p2y = s.p2.y;
   netTarget.has = true;
-  // 距离太大说明是重生/复位，直接瞬移；否则维持当前渲染位置等待插值
+  // 蓝方是远端玩家：距离太大说明是重生/复位，直接瞬移；否则维持当前渲染位置等待插值。
   if (Math.hypot(s.p1.x - r1x, s.p1.y - r1y) < 80) { p1.x = r1x; p1.y = r1y; }
-  if (Math.hypot(s.p2.x - r2x, s.p2.y - r2y) < 80) { p2.x = r2x; p2.y = r2y; }
+  // 红方是本机玩家：活动回合中不吃房主回传坐标，避免网络校正把角色来回拽。
+  if (netMode === 'guest' && s.p2.alive && !s.roundOver && !wasRoundOver) {
+    p2.x = localP2.x; p2.y = localP2.y;
+    p2.vx = localP2.vx; p2.vy = localP2.vy;
+  }
   bullets = s.bullets.map(b => ({
     x: b.x, y: b.y, vx: b.vx || 0, vy: b.vy || 0,
     bounces: b.bounces,

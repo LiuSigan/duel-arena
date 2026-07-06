@@ -30,6 +30,7 @@ let waitingPlayer = null;
 // 游戏状态是实时快照：旧 state 没有补发价值。这里做合并/节流，避免客端网络或设备稍慢时
 // WebSocket 可靠队列越积越长，看到的画面变成过期录像。
 const STATE_FORWARD_INTERVAL_MS = 1000 / 30;
+const POSE_FORWARD_INTERVAL_MS = 1000 / 45;
 const MAX_STATE_BUFFERED_BYTES = 128 * 1024;
 
 function makeCode() {
@@ -47,8 +48,11 @@ function send(ws, obj) {
 function clearStateQueue(ws) {
   if (!ws) return;
   if (ws.stateFlushTimer) clearTimeout(ws.stateFlushTimer);
+  if (ws.poseFlushTimer) clearTimeout(ws.poseFlushTimer);
   ws.stateFlushTimer = null;
+  ws.poseFlushTimer = null;
   ws.latestStateMsg = null;
+  ws.latestPoseMsg = null;
 }
 
 function flushLatestState(ws) {
@@ -72,6 +76,27 @@ function sendLatestState(ws, msg) {
   const elapsed = Date.now() - (ws.lastStateSentAt || 0);
   const delay = Math.max(0, STATE_FORWARD_INTERVAL_MS - elapsed);
   ws.stateFlushTimer = setTimeout(() => flushLatestState(ws), delay);
+}
+
+function flushLatestPose(ws) {
+  ws.poseFlushTimer = null;
+  const msg = ws.latestPoseMsg;
+  ws.latestPoseMsg = null;
+  if (!msg || !ws || ws.readyState !== ws.OPEN) return;
+  if (ws.bufferedAmount > MAX_STATE_BUFFERED_BYTES) return;
+
+  send(ws, msg);
+  ws.lastPoseSentAt = Date.now();
+}
+
+function sendLatestPose(ws, msg) {
+  if (!ws || ws.readyState !== ws.OPEN) return;
+  ws.latestPoseMsg = msg;
+  if (ws.poseFlushTimer) return;
+
+  const elapsed = Date.now() - (ws.lastPoseSentAt || 0);
+  const delay = Math.max(0, POSE_FORWARD_INTERVAL_MS - elapsed);
+  ws.poseFlushTimer = setTimeout(() => flushLatestPose(ws), delay);
 }
 
 function otherPeer(ws) {
@@ -139,10 +164,18 @@ wss.on('connection', (ws) => {
 
       // ---- 控制/房间指令：保持即时转发 ----
       case 'input':
+      case 'shot':
       case 'restart':
       case 'resetMatch': {
         const peer = otherPeer(ws);
         if (peer) send(peer, msg);
+        break;
+      }
+
+      // ---- 玩家位置：只保留最新姿态，避免旧位置排队造成回放式抖动 ----
+      case 'pose': {
+        const peer = otherPeer(ws);
+        if (peer) sendLatestPose(peer, msg);
         break;
       }
 
