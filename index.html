@@ -462,9 +462,19 @@ document.querySelectorAll('#mapSelect .option-btn').forEach(btn => {
 setMap(currentMapKey);
 
 // ---------- 幻变战场专属：每隔几秒随机让一面墙移动 / 消失 / 新生 ----------
-function safeToPlaceObstacle(rect) {
+function rectsOverlap(a, b) {
+  return a.x < b.x + b.w && a.x + a.w > b.x && a.y < b.y + b.h && a.y + a.h > b.y;
+}
+
+// 新墙的落点要离玩家当前位置留够大的安全距离，并且不能和已有的墙叠在一起，
+// 否则容易出现"墙一面面围过来，人被堵死在角落"的情况
+function safeToPlaceObstacle(rect, skipOb) {
+  const PLAYER_CLEARANCE = 70;
   for (const pl of [p1, p2]) {
-    if (pl && pl.alive && circleRectCollide(pl.x, pl.y, pl.radius + 6, rect)) return false;
+    if (pl && pl.alive && circleRectCollide(pl.x, pl.y, pl.radius + PLAYER_CLEARANCE, rect)) return false;
+  }
+  for (const ob of obstacles) {
+    if (ob !== skipOb && rectsOverlap(rect, ob)) return false;
   }
   return true;
 }
@@ -481,7 +491,7 @@ function shuffleWalls() {
       const nx = 60 + Math.random() * (W - 120 - ob.w);
       const ny = 60 + Math.random() * (H - 120 - ob.h);
       const candidate = { x: nx, y: ny, w: ob.w, h: ob.h };
-      if (safeToPlaceObstacle(candidate)) { ob.x = nx; ob.y = ny; break; }
+      if (safeToPlaceObstacle(candidate, ob)) { ob.x = nx; ob.y = ny; break; }
     }
   } else if (obstacles.length < 12) {
     // 新生：随机尺寸的新墙
@@ -492,6 +502,57 @@ function shuffleWalls() {
       const ny = 60 + Math.random() * (H - 120 - h);
       const candidate = { x: nx, y: ny, w, h };
       if (safeToPlaceObstacle(candidate)) { obstacles.push(candidate); break; }
+    }
+  }
+}
+
+// 兜底保险：万一玩家还是和某面墙重叠了（比如墙在极端情况下卡到了安全区边缘），
+// 每帧检测一次，直接把玩家推出墙外，避免真的卡死出不来。多扫几遍是为了处理
+// "刚从一面墙里被推出来，正好又撞进旁边另一面墙"的连锁情况
+function resolveObstacleOverlap(player) {
+  for (let pass = 0; pass < 4; pass++) {
+    let hadOverlap = false;
+    for (const ob of obstacles) {
+      if (!circleRectCollide(player.x, player.y, player.radius, ob)) continue;
+      hadOverlap = true;
+      const nx = Math.max(ob.x, Math.min(player.x, ob.x + ob.w));
+      const ny = Math.max(ob.y, Math.min(player.y, ob.y + ob.h));
+      const dx = player.x - nx, dy = player.y - ny;
+      const dist = Math.hypot(dx, dy);
+      if (dist > 0.01) {
+        const push = (player.radius - dist) + 1;
+        player.x += (dx / dist) * push;
+        player.y += (dy / dist) * push;
+      } else {
+        // 玩家中心恰好落在矩形内部（墙正好套住了人）：沿最近的一条边直接推出去，一次到位
+        const distLeft = player.x - ob.x, distRight = (ob.x + ob.w) - player.x;
+        const distTop = player.y - ob.y, distBottom = (ob.y + ob.h) - player.y;
+        const minDist = Math.min(distLeft, distRight, distTop, distBottom);
+        const push = minDist + player.radius + 1;
+        if (minDist === distLeft) player.x -= push;
+        else if (minDist === distRight) player.x += push;
+        else if (minDist === distTop) player.y -= push;
+        else player.y += push;
+      }
+    }
+    player.x = Math.max(player.radius, Math.min(W - player.radius, player.x));
+    player.y = Math.max(player.radius, Math.min(H - player.radius, player.y));
+    if (!hadOverlap) return;
+  }
+  // 极端情况：两面墙几乎同时从两侧夹过来，上面的推挤会在两面墙之间来回震荡出不去。
+  // 保底方案：直接在附近由近到远画圈搜索一个完全没有障碍物的位置，把人传送过去
+  if (obstacles.some(ob => circleRectCollide(player.x, player.y, player.radius, ob))) {
+    for (let r = 20; r <= 400; r += 20) {
+      let found = false;
+      for (let i = 0; i < 16 && !found; i++) {
+        const a = (i / 16) * Math.PI * 2;
+        const nx = Math.max(player.radius, Math.min(W - player.radius, player.x + Math.cos(a) * r));
+        const ny = Math.max(player.radius, Math.min(H - player.radius, player.y + Math.sin(a) * r));
+        if (!obstacles.some(ob => circleRectCollide(nx, ny, player.radius, ob))) {
+          player.x = nx; player.y = ny; found = true;
+        }
+      }
+      if (found) break;
     }
   }
 }
@@ -1077,6 +1138,9 @@ function update() {
       shuffleWalls();
       wallShuffleTimer = 180 + Math.random() * 180;
     }
+    // 每帧兜底检查，防止玩家因为墙体变化被卡在墙里出不来
+    resolveObstacleOverlap(p1);
+    resolveObstacleOverlap(p2);
   }
 
   // 医疗包刷新与拾取
