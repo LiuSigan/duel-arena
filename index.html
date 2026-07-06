@@ -14,7 +14,7 @@
     min-height: 100vh;
     font-family: 'Segoe UI', Arial, sans-serif;
     color: #eee;
-    overflow: hidden;
+    overflow: auto;
   }
   h1 {
     margin-bottom: 10px;
@@ -26,7 +26,7 @@
   #hud {
     display: flex;
     justify-content: space-between;
-    width: 900px;
+    width: var(--arena-width, 900px);
     margin-bottom: 8px;
   }
   .player-info { width: 45%; }
@@ -73,7 +73,7 @@
   #controls {
     display: flex;
     justify-content: space-between;
-    width: 900px;
+    width: var(--arena-width, 900px);
     margin-top: 10px;
     font-size: 12px;
     color: #888;
@@ -264,9 +264,10 @@
 
   <div id="mapSelect" style="margin-top:22px;">
     <div style="font-size:14px; color:#aaa; margin-bottom:10px;">🗺 选择地图 <span style="font-size:11px; color:#666;">(联机时以房主选择为准)</span></div>
-    <div style="display:flex; gap:10px; justify-content:center;">
+    <div style="display:flex; gap:10px; justify-content:center; flex-wrap:wrap;">
       <button class="option-btn selected" data-map="classic">🏰 经典擂台<span class="sub">四角堡垒 + 之字通道，攻防均衡</span></button>
       <button class="option-btn" data-map="outpost">🌉 旷野哨站<span class="sub">开阔通道 + 中心孤堡，适合远程狙杀</span></button>
+      <button class="option-btn" data-map="chaos">🌪 幻变战场<span class="sub">超大地图·墙体随机移动/消失</span></button>
     </div>
   </div>
   <div class="mode-select" id="modeSelect">
@@ -314,7 +315,16 @@
 <script>
 const canvas = document.getElementById('gameCanvas');
 const ctx = canvas.getContext('2d');
-const W = canvas.width, H = canvas.height;
+let W = canvas.width, H = canvas.height;
+
+// 切换地图时同步调整画布尺寸（大地图会撑大整个竞技场），HUD/控制栏用 CSS 变量跟随宽度
+function resizeArena(w, h) {
+  if (W === w && H === h) return;
+  W = w; H = h;
+  canvas.width = w;
+  canvas.height = h;
+  document.documentElement.style.setProperty('--arena-width', w + 'px');
+}
 
 let mode = 'pvp'; // 'pvp' or 'pve'
 let matchOver = false;
@@ -359,6 +369,7 @@ const MAPS = {
   // 经典擂台：转角堡垒 + 之字形通道 + 中心决斗点，制造迂回和埋伏点
   classic: {
     label: '经典擂台',
+    width: 900, height: 520,
     obstacles: [
       // 四角 L 型堡垒，保护出生点又不完全挡视线
       {x: 30,  y: 30,  w: 80, h: 22},
@@ -390,6 +401,7 @@ const MAPS = {
   // 旷野哨站：上下各留一条中央大通道，视野更开阔，适合远程对狙
   outpost: {
     label: '旷野哨站',
+    width: 900, height: 520,
     obstacles: [
       {x: 0,   y: 150, w: 340, h: 24},
       {x: 560, y: 150, w: 340, h: 24},
@@ -404,21 +416,85 @@ const MAPS = {
       {x: 730, y: 260},
     ],
   },
+  // 幻变战场：地图尺寸大幅放大，墙壁每隔几秒随机移动/消失/新生，纯随机，逼玩家不断重新读图
+  chaos: {
+    label: '幻变战场',
+    width: 1200, height: 700,
+    dynamic: true,
+    obstacles: [
+      {x: 300, y: 80,  w: 30, h: 140},
+      {x: 300, y: 480, w: 30, h: 140},
+      {x: 870, y: 80,  w: 30, h: 140},
+      {x: 870, y: 480, w: 30, h: 140},
+      {x: 600, y: 190, w: 140, h: 30},
+      {x: 600, y: 480, w: 140, h: 30},
+      {x: 480, y: 320, w: 60, h: 60},
+      {x: 720, y: 320, w: 60, h: 60},
+    ],
+    pickupSpots: [
+      {x: 600, y: 100},
+      {x: 600, y: 600},
+      {x: 200, y: 350},
+      {x: 1000, y: 350},
+      {x: 450, y: 350},
+      {x: 750, y: 350},
+    ],
+  },
 };
 let currentMapKey = 'classic';
-let obstacles = MAPS[currentMapKey].obstacles;
-let PICKUP_SPOTS = MAPS[currentMapKey].pickupSpots;
+let obstacles = [];
+let PICKUP_SPOTS = [];
+let wallShuffleTimer = 0;
 
 function setMap(key) {
   if (!MAPS[key]) return;
   currentMapKey = key;
-  obstacles = MAPS[key].obstacles;
+  // 深拷贝障碍物，避免"幻变战场"的随机改动污染 MAPS 里的原始模板
+  obstacles = MAPS[key].obstacles.map(o => ({ ...o }));
   PICKUP_SPOTS = MAPS[key].pickupSpots;
+  wallShuffleTimer = 120;
+  resizeArena(MAPS[key].width || 900, MAPS[key].height || 520);
   document.querySelectorAll('#mapSelect .option-btn').forEach(b => b.classList.toggle('selected', b.dataset.map === key));
 }
 document.querySelectorAll('#mapSelect .option-btn').forEach(btn => {
   btn.addEventListener('click', () => setMap(btn.dataset.map));
 });
+setMap(currentMapKey);
+
+// ---------- 幻变战场专属：每隔几秒随机让一面墙移动 / 消失 / 新生 ----------
+function safeToPlaceObstacle(rect) {
+  for (const pl of [p1, p2]) {
+    if (pl && pl.alive && circleRectCollide(pl.x, pl.y, pl.radius + 6, rect)) return false;
+  }
+  return true;
+}
+
+function shuffleWalls() {
+  const roll = Math.random();
+  if (roll < 0.35 && obstacles.length > 4) {
+    // 消失：随机移除一面墙，但保留最少数量的掩体
+    obstacles.splice(Math.floor(Math.random() * obstacles.length), 1);
+  } else if (roll < 0.75 && obstacles.length > 0) {
+    // 移动：随机挑一面墙，挪到新的随机位置
+    const ob = obstacles[Math.floor(Math.random() * obstacles.length)];
+    for (let tries = 10; tries > 0; tries--) {
+      const nx = 60 + Math.random() * (W - 120 - ob.w);
+      const ny = 60 + Math.random() * (H - 120 - ob.h);
+      const candidate = { x: nx, y: ny, w: ob.w, h: ob.h };
+      if (safeToPlaceObstacle(candidate)) { ob.x = nx; ob.y = ny; break; }
+    }
+  } else if (obstacles.length < 12) {
+    // 新生：随机尺寸的新墙
+    const w = 24 + Math.random() * 100;
+    const h = 24 + Math.random() * 100;
+    for (let tries = 10; tries > 0; tries--) {
+      const nx = 60 + Math.random() * (W - 120 - w);
+      const ny = 60 + Math.random() * (H - 120 - h);
+      const candidate = { x: nx, y: ny, w, h };
+      if (safeToPlaceObstacle(candidate)) { obstacles.push(candidate); break; }
+    }
+  }
+}
 
 let healthPickup = null;
 let pickupRespawnTimer = 150;
@@ -427,7 +503,10 @@ const PICKUP_RESPAWN = 320;
 
 function trySpawnPickup() {
   if (healthPickup || pickupRespawnTimer > 0) return;
-  const spot = PICKUP_SPOTS[Math.floor(Math.random() * PICKUP_SPOTS.length)];
+  // 幻变战场的墙会挪动，刷新前过滤掉当前被墙盖住的点位，避免医疗包卡进墙里拿不到
+  const freeSpots = PICKUP_SPOTS.filter(s => !obstacles.some(ob => s.x > ob.x && s.x < ob.x + ob.w && s.y > ob.y && s.y < ob.y + ob.h));
+  if (freeSpots.length === 0) return;
+  const spot = freeSpots[Math.floor(Math.random() * freeSpots.length)];
   healthPickup = { x: spot.x, y: spot.y, pulse: 0 };
 }
 
@@ -991,6 +1070,15 @@ function update() {
   if (p1.hitFlash > 0) p1.hitFlash--;
   if (p2.hitFlash > 0) p2.hitFlash--;
 
+  // 幻变战场：墙壁随机移动/消失/新生，纯随机间隔（约 3～6 秒一次）
+  if (MAPS[currentMapKey].dynamic) {
+    wallShuffleTimer--;
+    if (wallShuffleTimer <= 0) {
+      shuffleWalls();
+      wallShuffleTimer = 180 + Math.random() * 180;
+    }
+  }
+
   // 医疗包刷新与拾取
   if (pickupRespawnTimer > 0) pickupRespawnTimer--;
   trySpawnPickup();
@@ -1420,6 +1508,8 @@ function buildState() {
       particles: particles.map(pt => ({ x: pt.x, y: pt.y, life: pt.life, color: pt.color })),
       floatingTexts: floatingTexts.map(t => ({ x: t.x, y: t.y, text: t.text, color: t.color, life: t.life })),
       healthPickup: healthPickup ? { x: healthPickup.x, y: healthPickup.y, pulse: healthPickup.pulse } : null,
+      // 幻变战场的墙会实时变化，同步给加入方，让双方画面一致（静态地图不需要，省流量）
+      obstacles: MAPS[currentMapKey].dynamic ? obstacles.map(o => ({ x: o.x, y: o.y, w: o.w, h: o.h })) : null,
       score1, score2, roundOver, matchOver, shakeTimer, shakeMag,
       overlayShow: document.getElementById('overlay').classList.contains('show'),
       winnerText: document.getElementById('winnerText').textContent,
@@ -1452,6 +1542,7 @@ function applyRemoteState(s) {
   particles = s.particles;
   floatingTexts = s.floatingTexts;
   healthPickup = s.healthPickup;
+  if (s.obstacles) obstacles = s.obstacles;
   score1 = s.score1; score2 = s.score2;
   roundOver = s.roundOver; matchOver = s.matchOver;
   shakeTimer = s.shakeTimer; shakeMag = s.shakeMag;
