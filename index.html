@@ -679,9 +679,9 @@ window.addEventListener('keydown', (e) => {
   if (e.code === 'Space' || e.code === 'Enter') e.preventDefault();
   if (netMode === 'guest') {
     if (!wasPressed && isNetInputCode(e.code)) sendGuestPose(true);
-    if (!wasPressed && e.code === 'Space') sendGuestShot();
-    if (e.code === 'KeyR' && roundOver) wsSend({ type: matchOver ? 'resetMatch' : 'restart' });
-    if (e.code === 'KeyT' && roundOver) wsSend({ type: 'resetMatch' });
+    if (!wasPressed && e.code === 'Space') tryGuestShoot();
+    if (e.code === 'KeyR' && roundOver) requestGuestRestart(matchOver ? 'resetMatch' : 'restart');
+    if (e.code === 'KeyT' && roundOver) requestGuestRestart('resetMatch');
   } else {
     if (e.code === 'KeyR' && roundOver) { matchOver ? resetMatch() : resetRound(); }
     if (e.code === 'KeyT' && roundOver) resetMatch();
@@ -730,8 +730,8 @@ function segmentBlocked(x1, y1, x2, y2) {
 
 // ---------- 射击 ----------
 function shoot(player, target, aimPoint) {
-  if (player.cooldown > 0 || !player.alive) return;
-  if (player.reloading || player.ammo <= 0) return; // 弹匣打空，必须先装弹
+  if (player.cooldown > 0 || !player.alive) return false;
+  if (player.reloading || player.ammo <= 0) return false; // 弹匣打空，必须先装弹
   const aim = aimPoint || target;
   const angle = Math.atan2(aim.y - player.y, aim.x - player.x);
   bullets.push({
@@ -761,6 +761,7 @@ function shoot(player, target, aimPoint) {
     player.reloading = true;
     player.reloadTimer = RELOAD_DURATION;
   }
+  return true;
 }
 
 // 每帧推进装弹进度
@@ -1392,6 +1393,8 @@ function draw() {
 function loop() {
   if (netMode === 'guest') {
     updateGuestOwnedPlayer();
+    tickGuestOwnedWeapon();
+    if (keys['Space']) tryGuestShoot();
     sendGuestPose();
     // 蓝方是远端玩家，平滑追随房主状态；红方是本机玩家，不再被房主坐标拉扯。
     if (netTarget.has) {
@@ -1444,6 +1447,8 @@ let shotSeq = 0;
 let lastRemoteVisualAt = performance.now();
 let lastObstacleSyncKey = '';
 let lastObstacleSyncAt = 0;
+let lastLocalShotAt = 0;
+let pendingLocalRestartUntil = 0;
 
 function resetNetSyncState() {
   remoteInput = { up: false, down: false, left: false, right: false };
@@ -1456,6 +1461,8 @@ function resetNetSyncState() {
   lastRemoteVisualAt = performance.now();
   lastObstacleSyncKey = '';
   lastObstacleSyncAt = 0;
+  lastLocalShotAt = 0;
+  pendingLocalRestartUntil = 0;
 }
 
 function isNetInputCode(code) {
@@ -1616,9 +1623,33 @@ function sendGuestPose(force = false) {
   if (wsSend({ type: 'pose', pose: buildGuestPose() })) lastPoseSentAt = now;
 }
 
-function sendGuestShot() {
+function tryGuestShoot() {
   if (netMode !== 'guest' || !gameRunning || roundOver || !p2 || !p2.alive) return;
+  const beforeBulletCount = bullets.length;
+  if (!shoot(p2, p1)) return;
+  lastLocalShotAt = performance.now();
+  for (let i = beforeBulletCount; i < bullets.length; i++) {
+    bullets[i].predictedGuest = true;
+    bullets[i].predictedUntil = lastLocalShotAt + 700;
+  }
   wsSend({ type: 'shot', seq: ++shotSeq, pose: buildGuestPose() });
+}
+
+function tickGuestOwnedWeapon() {
+  if (!p2) return;
+  if (p2.cooldown > 0) p2.cooldown--;
+  tickReload(p2);
+}
+
+function requestGuestRestart(type) {
+  if (netMode !== 'guest' || !roundOver) return;
+  if (type === 'resetMatch') resetMatch();
+  else resetRound();
+  pendingLocalRestartUntil = performance.now() + 700;
+  netTarget.has = false;
+  lastRemoteVisualAt = performance.now();
+  sendGuestPose(true);
+  wsSend({ type });
 }
 
 function updateGuestOwnedPlayer() {
@@ -1763,9 +1794,19 @@ function broadcastState(force = false) {
 }
 
 function applyRemoteState(s) {
+  const now = performance.now();
+  if (netMode === 'guest' && pendingLocalRestartUntil > now && s.roundOver) return;
+  if (netMode === 'guest' && pendingLocalRestartUntil > 0 && !s.roundOver) pendingLocalRestartUntil = 0;
+
   // 保留当前渲染坐标，把网络包里的最新坐标记为插值目标，渲染循环里平滑逼近
   const r1x = p1.x, r1y = p1.y;
-  const localP2 = { x: p2.x, y: p2.y, vx: p2.vx, vy: p2.vy };
+  const localP2 = {
+    x: p2.x, y: p2.y, vx: p2.vx, vy: p2.vy,
+    ammo: p2.ammo, reloading: p2.reloading, reloadTimer: p2.reloadTimer, cooldown: p2.cooldown,
+  };
+  const predictedGuestBullets = netMode === 'guest'
+    ? bullets.filter(b => b.predictedGuest && (b.predictedUntil || 0) > now)
+    : [];
   const wasRoundOver = roundOver;
   Object.assign(p1, s.p1);
   Object.assign(p2, s.p2);
@@ -1778,12 +1819,28 @@ function applyRemoteState(s) {
   if (netMode === 'guest' && s.p2.alive && !s.roundOver && !wasRoundOver) {
     p2.x = localP2.x; p2.y = localP2.y;
     p2.vx = localP2.vx; p2.vy = localP2.vy;
+    if (now - lastLocalShotAt < 700) {
+      p2.ammo = localP2.ammo;
+      p2.reloading = localP2.reloading;
+      p2.reloadTimer = localP2.reloadTimer;
+      p2.cooldown = localP2.cooldown;
+    }
   }
-  bullets = s.bullets.map(b => ({
+  const authoritativeBullets = s.bullets.map(b => ({
     x: b.x, y: b.y, vx: b.vx || 0, vy: b.vy || 0,
     bounces: b.bounces,
     owner: { color: b.ownerColor },
   }));
+  bullets = authoritativeBullets;
+  if (predictedGuestBullets.length > 0) {
+    for (const predicted of predictedGuestBullets) {
+      const matched = authoritativeBullets.some(b =>
+        b.owner.color === predicted.owner.color &&
+        Math.hypot(b.x - predicted.x, b.y - predicted.y) < 160
+      );
+      if (!matched) bullets.push(predicted);
+    }
+  }
   particles = s.particles.map(pt => ({ ...pt, vx: pt.vx || 0, vy: pt.vy || 0 }));
   floatingTexts = s.floatingTexts.map(t => ({ ...t, vy: t.vy || -0.8 }));
   healthPickup = s.healthPickup;
