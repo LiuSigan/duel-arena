@@ -641,7 +641,7 @@ function resetRound() {
   document.getElementById('matchEndPanel').style.display = 'none';
   document.getElementById('restartHint').textContent = '按 R 键开始下一局';
   updateHUD();
-  if (netMode === 'host') broadcastState();
+  if (netMode === 'host') broadcastState(true);
 }
 
 function resetMatch() {
@@ -674,9 +674,11 @@ function updateHUD() {
 // ---------- 输入 ----------
 const keys = {};
 window.addEventListener('keydown', (e) => {
+  const wasPressed = !!keys[e.code];
   keys[e.code] = true;
   if (e.code === 'Space' || e.code === 'Enter') e.preventDefault();
   if (netMode === 'guest') {
+    if (!wasPressed && isNetInputCode(e.code)) sendGuestInput(true);
     if (e.code === 'KeyR' && roundOver) wsSend({ type: matchOver ? 'resetMatch' : 'restart' });
     if (e.code === 'KeyT' && roundOver) wsSend({ type: 'resetMatch' });
   } else {
@@ -684,7 +686,11 @@ window.addEventListener('keydown', (e) => {
     if (e.code === 'KeyT' && roundOver) resetMatch();
   }
 });
-window.addEventListener('keyup', (e) => { keys[e.code] = false; });
+window.addEventListener('keyup', (e) => {
+  const wasPressed = !!keys[e.code];
+  keys[e.code] = false;
+  if (netMode === 'guest' && wasPressed && isNetInputCode(e.code)) sendGuestInput(true);
+});
 
 // ---------- 碰撞辅助（移动用，圆 vs 矩形） ----------
 function circleRectCollide(cx, cy, r, rect) {
@@ -1012,7 +1018,7 @@ function endRound(winner) {
   }
 
   document.getElementById('overlay').classList.add('show');
-  if (netMode === 'host') broadcastState();
+  if (netMode === 'host') broadcastState(true);
 }
 
 // ---------- 主循环 ----------
@@ -1391,11 +1397,12 @@ function loop() {
     sendGuestInput();
     // 插值：每帧向最新网络坐标逼近，画面平滑不跳帧
     if (netTarget.has) {
-      p1.x += (netTarget.p1x - p1.x) * 0.5;
-      p1.y += (netTarget.p1y - p1.y) * 0.5;
-      p2.x += (netTarget.p2x - p2.x) * 0.5;
-      p2.y += (netTarget.p2y - p2.y) * 0.5;
+      p1.x += (netTarget.p1x - p1.x) * NET_INTERP_ALPHA;
+      p1.y += (netTarget.p1y - p1.y) * NET_INTERP_ALPHA;
+      p2.x += (netTarget.p2x - p2.x) * NET_INTERP_ALPHA;
+      p2.y += (netTarget.p2y - p2.y) * NET_INTERP_ALPHA;
     }
+    tickRemoteVisuals();
   } else {
     update();
   }
@@ -1407,6 +1414,7 @@ function loop() {
 function startGame(selectedMode) {
   mode = selectedMode;
   netMode = selectedMode === 'online-host' ? 'host' : (selectedMode === 'online-guest' ? 'guest' : null);
+  if (netMode) resetNetSyncState();
   document.getElementById('startOverlay').style.display = 'none';
   if (netMode) {
     document.getElementById('p1ControlHint').textContent = netMode === 'guest' ? '你(红方，通过网络控制)：WASD 移动 | 空格 射击' : '你(蓝方): WASD 移动 | 空格 射击';
@@ -1428,6 +1436,28 @@ let netMode = null; // null | 'host' | 'guest'
 let ws = null;
 let remoteInput = { up: false, down: false, left: false, right: false, shoot: false };
 let netTarget = { has: false, p1x: 0, p1y: 0, p2x: 0, p2y: 0 };
+const NET_STATE_INTERVAL_MS = 1000 / 30;
+const NET_INPUT_HEARTBEAT_MS = 250;
+const NET_MAX_BUFFERED_BYTES = 128 * 1024;
+const NET_INTERP_ALPHA = 0.35;
+let lastStateSentAt = 0;
+let lastInputSentAt = 0;
+let lastInputPayload = '';
+let inputSeq = 0;
+let lastRemoteVisualAt = performance.now();
+
+function resetNetSyncState() {
+  remoteInput = { up: false, down: false, left: false, right: false, shoot: false };
+  netTarget = { has: false, p1x: 0, p1y: 0, p2x: 0, p2y: 0 };
+  lastStateSentAt = 0;
+  lastInputSentAt = 0;
+  lastInputPayload = '';
+  lastRemoteVisualAt = performance.now();
+}
+
+function isNetInputCode(code) {
+  return code === 'KeyW' || code === 'KeyA' || code === 'KeyS' || code === 'KeyD' || code === 'Space';
+}
 
 document.getElementById('netBtn').addEventListener('click', () => {
   document.getElementById('modeSelect').style.display = 'none';
@@ -1460,7 +1490,10 @@ function ensureWS(onReady, onFail) {
 }
 
 function wsSend(obj) {
-  if (ws && ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify(obj));
+  if (!ws || ws.readyState !== WebSocket.OPEN) return false;
+  if (obj.type === 'state' && ws.bufferedAmount > NET_MAX_BUFFERED_BYTES) return false;
+  ws.send(JSON.stringify(obj));
+  return true;
 }
 
 function handleServerMsg(msg) {
@@ -1551,30 +1584,67 @@ document.getElementById('joinBtn').addEventListener('click', () => {
   );
 });
 
-function sendGuestInput() {
-  wsSend({
-    type: 'input',
-    input: {
-      up: !!keys['KeyW'], down: !!keys['KeyS'],
-      left: !!keys['KeyA'], right: !!keys['KeyD'],
-      shoot: !!keys['Space'],
-    },
-  });
+function getGuestInput() {
+  return {
+    up: !!keys['KeyW'], down: !!keys['KeyS'],
+    left: !!keys['KeyA'], right: !!keys['KeyD'],
+    shoot: !!keys['Space'],
+  };
+}
+
+function sendGuestInput(force = false) {
+  if (netMode !== 'guest') return;
+  const now = performance.now();
+  const input = getGuestInput();
+  const payload = JSON.stringify(input);
+  const changed = payload !== lastInputPayload;
+  if (!force && !changed && now - lastInputSentAt < NET_INPUT_HEARTBEAT_MS) return;
+  if (!force && changed && now - lastInputSentAt < 16) return;
+
+  if (wsSend({ type: 'input', input, seq: ++inputSeq, clientTime: Math.round(now) })) {
+    lastInputPayload = payload;
+    lastInputSentAt = now;
+  }
+}
+
+function netNum(n) {
+  return Math.round(n * 10) / 10;
+}
+
+function buildNetPlayer(player) {
+  return {
+    x: netNum(player.x), y: netNum(player.y),
+    hp: player.hp, alive: player.alive, hitFlash: player.hitFlash,
+    color: player.color, colorLight: player.colorLight, colorDark: player.colorDark,
+    ammo: player.ammo, reloading: player.reloading,
+  };
 }
 
 function buildState() {
   return {
     type: 'state',
     state: {
-      p1: { x: p1.x, y: p1.y, hp: p1.hp, alive: p1.alive, hitFlash: p1.hitFlash, color: p1.color, colorLight: p1.colorLight, colorDark: p1.colorDark, ammo: p1.ammo, reloading: p1.reloading },
-      p2: { x: p2.x, y: p2.y, hp: p2.hp, alive: p2.alive, hitFlash: p2.hitFlash, color: p2.color, colorLight: p2.colorLight, colorDark: p2.colorDark, ammo: p2.ammo, reloading: p2.reloading },
-      bullets: bullets.map(b => ({ x: b.x, y: b.y, bounces: b.bounces, ownerColor: b.owner.color })),
-      particles: particles.map(pt => ({ x: pt.x, y: pt.y, life: pt.life, color: pt.color })),
-      floatingTexts: floatingTexts.map(t => ({ x: t.x, y: t.y, text: t.text, color: t.color, life: t.life })),
-      healthPickup: healthPickup ? { x: healthPickup.x, y: healthPickup.y, pulse: healthPickup.pulse } : null,
+      p1: buildNetPlayer(p1),
+      p2: buildNetPlayer(p2),
+      bullets: bullets.map(b => ({
+        x: netNum(b.x), y: netNum(b.y),
+        vx: netNum(b.vx || 0), vy: netNum(b.vy || 0),
+        bounces: b.bounces || 0,
+        ownerColor: b.owner.color,
+      })),
+      particles: particles.slice(-80).map(pt => ({
+        x: netNum(pt.x), y: netNum(pt.y),
+        vx: netNum(pt.vx || 0), vy: netNum(pt.vy || 0),
+        life: netNum(pt.life), color: pt.color,
+      })),
+      floatingTexts: floatingTexts.slice(-20).map(t => ({
+        x: netNum(t.x), y: netNum(t.y),
+        text: t.text, color: t.color, life: netNum(t.life), vy: netNum(t.vy || -0.8),
+      })),
+      healthPickup: healthPickup ? { x: netNum(healthPickup.x), y: netNum(healthPickup.y), pulse: netNum(healthPickup.pulse) } : null,
       // 幻变战场的墙会实时变化，同步给加入方，让双方画面一致（静态地图不需要，省流量）
-      obstacles: MAPS[currentMapKey].dynamic ? obstacles.map(o => ({ x: o.x, y: o.y, w: o.w, h: o.h })) : null,
-      score1, score2, roundOver, matchOver, shakeTimer, shakeMag,
+      obstacles: MAPS[currentMapKey].dynamic ? obstacles.map(o => ({ x: netNum(o.x), y: netNum(o.y), w: netNum(o.w), h: netNum(o.h) })) : null,
+      score1, score2, roundOver, matchOver, shakeTimer: netNum(shakeTimer), shakeMag: netNum(shakeMag),
       overlayShow: document.getElementById('overlay').classList.contains('show'),
       winnerText: document.getElementById('winnerText').textContent,
       winnerColor: document.getElementById('winnerText').style.color,
@@ -1587,8 +1657,12 @@ function buildState() {
   };
 }
 
-function broadcastState() {
-  wsSend(buildState());
+function broadcastState(force = false) {
+  const now = performance.now();
+  if (!force && now - lastStateSentAt < NET_STATE_INTERVAL_MS) return;
+  const msg = buildState();
+  if (force) msg.critical = true;
+  if (wsSend(msg)) lastStateSentAt = now;
 }
 
 function applyRemoteState(s) {
@@ -1602,9 +1676,13 @@ function applyRemoteState(s) {
   // 距离太大说明是重生/复位，直接瞬移；否则维持当前渲染位置等待插值
   if (Math.hypot(s.p1.x - r1x, s.p1.y - r1y) < 80) { p1.x = r1x; p1.y = r1y; }
   if (Math.hypot(s.p2.x - r2x, s.p2.y - r2y) < 80) { p2.x = r2x; p2.y = r2y; }
-  bullets = s.bullets.map(b => ({ x: b.x, y: b.y, bounces: b.bounces, owner: { color: b.ownerColor } }));
-  particles = s.particles;
-  floatingTexts = s.floatingTexts;
+  bullets = s.bullets.map(b => ({
+    x: b.x, y: b.y, vx: b.vx || 0, vy: b.vy || 0,
+    bounces: b.bounces,
+    owner: { color: b.ownerColor },
+  }));
+  particles = s.particles.map(pt => ({ ...pt, vx: pt.vx || 0, vy: pt.vy || 0 }));
+  floatingTexts = s.floatingTexts.map(t => ({ ...t, vy: t.vy || -0.8 }));
   healthPickup = s.healthPickup;
   if (s.obstacles) obstacles = s.obstacles;
   score1 = s.score1; score2 = s.score2;
@@ -1629,6 +1707,36 @@ function applyRemoteState(s) {
   } else {
     overlayEl.classList.remove('show');
   }
+  lastRemoteVisualAt = performance.now();
+}
+
+function tickRemoteVisuals() {
+  const now = performance.now();
+  const dt = Math.min(2, Math.max(0.25, (now - lastRemoteVisualAt) / (1000 / 60)));
+  lastRemoteVisualAt = now;
+
+  for (const b of bullets) {
+    b.x += (b.vx || 0) * dt;
+    b.y += (b.vy || 0) * dt;
+  }
+
+  for (let i = particles.length - 1; i >= 0; i--) {
+    const pt = particles[i];
+    pt.x += (pt.vx || 0) * dt;
+    pt.y += (pt.vy || 0) * dt;
+    pt.life -= dt;
+    if (pt.life <= 0) particles.splice(i, 1);
+  }
+
+  for (let i = floatingTexts.length - 1; i >= 0; i--) {
+    const t = floatingTexts[i];
+    t.y += (t.vy || -0.8) * dt;
+    t.life -= dt;
+    if (t.life <= 0) floatingTexts.splice(i, 1);
+  }
+
+  if (healthPickup) healthPickup.pulse += 0.15 * dt;
+  if (shakeTimer > 0) shakeTimer = Math.max(0, shakeTimer - dt);
 }
 
 p1 = makePlayer(120, H/2, '#4fc3f7', '#8fe0ff', '#1565c0', false);
